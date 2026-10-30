@@ -24,8 +24,9 @@ extern "C" unsigned char s_coh_bitmap[];
 extern "C" volatile int s_coh_armed;
 
 namespace infamous_clock_probe {
-// EU EBOOT (BCES00220) provenance; US addresses re-verified in Task 6:
-// [TOC 0x78BFC0-0x7F08]=0x76959C, [0x76959C-0x7FF8]=0x7BC650. func_00078AA0 updates this clock.
+// US EBOOT (BCUS98119) clock layout, re-verified in Task 6 (EU BCES00220 provenance retained).
+// The clock base is identical in both builds; the TOC and the data pointers shift -0x48 in the US lift:
+// [TOC 0x78BF78-0x7F08]=0x769554, [0x769554-0x7FF8]=0x7BC650. The once-per-frame update stores raw dt at base+0.
 constexpr uint32_t base = 0x7BC650;
 using Clock = std::chrono::steady_clock;
 static Clock::time_point start;
@@ -228,7 +229,7 @@ static void init()
                             std::fprintf(stderr, "[FPSCAP] v150 F7 toggles a %.0f fps cap (starts OFF)\n", cap_fps); } }
     sim_on = e && !std::strcmp(e, "1");
     if (!sim_on && !(cap_fps >= 5.0 && cap_fps <= 240.0)) return;
-    if (word(0x7840B8) != 0x76959C || word(0x7615A4) != base) {
+    if (word(0x784070) != 0x769554 || word(0x76155C) != base) {
         std::fprintf(stderr, "[SIM-CLOCK] disabled: ELF clock layout differs from the expected EBOOT layout\n");
         return;
     }

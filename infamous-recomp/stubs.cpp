@@ -160,7 +160,7 @@ struct inf_mbi { void* base; void* abase; unsigned long aprot; unsigned short pa
 extern "C" __declspec(dllimport) size_t __stdcall VirtualQuery(const void*, inf_mbi*, size_t);
 
 static const uint32_t PM_FN_SETTINGS = 0x00FF0000u, PM_FN_QUIT = 0x00FF0010u, PM_FN_TRIM = 0x00FF0020u;
-static const uint32_t PM_TOC = 0x0078BFC0u;
+static const uint32_t PM_TOC = 0x0078BF78u;   /* US module TOC (Task 6); EU BCES00220 was 0x0078BFC0 */
 static const uint32_t PM_OID_SETTINGS = 0x0002094Du, PM_OID_QUIT = 0x00019F4Cu;
 
 static void pm_native_settings(ppu_context* ctx) { g_uiov_request = 1; std::fprintf(stderr, "[pausemenu] Settings\n"); ctx->gpr[3] = 0; }
