@@ -349,20 +349,63 @@ impl Session {
     }
 }
 
+/// Decide whether the measured `sha` is the release this port was built from.
+///
+/// The manifest (`[game].eboot_sha256`) is authoritative when it pins one or more hashes. A lock
+/// pin is accepted only when it matches one of the manifest's hashes (or, when the manifest pins
+/// none, the lock pin is the authority). A lock pin that conflicts with the manifest is a
+/// mixed-release state: the patch set was generated from a different ELF than the manifest
+/// describes, so it must be regenerated, never accepted as another valid executable.
+fn check_eboot_sha(
+    manifest: &[String],
+    lock_eboot: Option<&str>,
+    sha: &str,
+    force: bool,
+) -> Result<()> {
+    if !manifest.is_empty() {
+        if let Some(le) = lock_eboot {
+            if !manifest.iter().any(|m| m == le) {
+                bail!(
+                    "installer/generated.lock pins a different EBOOT.elf ({le}) than the release \
+                     pinned in installer/infamous.toml ({}).\n    \
+                     The patch set and the manifest describe different releases; regenerate the \
+                     lock (make-patches / rebase-patches) before installing.",
+                    manifest.join(", ")
+                );
+            }
+        }
+    }
+
+    let accepted: Vec<&str> = if !manifest.is_empty() {
+        manifest.iter().map(String::as_str).collect()
+    } else if let Some(le) = lock_eboot {
+        vec![le]
+    } else {
+        Vec::new()
+    };
+
+    if !accepted.is_empty() && !accepted.iter().any(|a| *a == sha) {
+        let msg = format!(
+            "this EBOOT.elf is not the release this port was made from (expected {})",
+            accepted.join(", ")
+        );
+        if !force {
+            bail!("{msg}.\n    --force tries anyway; expect the patch step to fail.");
+        }
+        util::warn(&msg);
+    }
+    Ok(())
+}
+
 fn eboot_hash_check(s: &Session, elf: &Path, lock: Option<&lock::Lock>) -> Result<String> {
     let sha = hash::sha256_file(elf)?;
     util::info(&format!("EBOOT.elf sha256 {sha}"));
-    let mut expected: Vec<String> = s.m.eboot_sha256.clone();
-    if let Some(e) = lock.and_then(|l| l.eboot.clone()) {
-        expected.push(e);
-    }
-    if !expected.is_empty() && !expected.contains(&sha) {
-        let msg = "this EBOOT.elf is not the version the port was made from (expected the European release BCES00220, v1.00 disc executable)";
-        if !s.o.force {
-            bail!("{msg}.\n    --force tries anyway; expect the patch step to fail.");
-        }
-        util::warn(msg);
-    }
+    check_eboot_sha(
+        &s.m.eboot_sha256,
+        lock.and_then(|l| l.eboot.as_deref()),
+        &sha,
+        s.o.force,
+    )?;
     Ok(sha)
 }
 
@@ -1215,5 +1258,40 @@ mod tests {
     #[test]
     fn usage_lists_rebase_patches() {
         assert!(USAGE.contains("rebase-patches"));
+    }
+
+    #[test]
+    fn eboot_manifest_only_accepts_the_pinned_hash() {
+        let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
+        let other = "0000000000000000000000000000000000000000000000000000000000000000";
+        let m = vec![us.to_string()];
+        assert!(check_eboot_sha(&m, None, us, false).is_ok());
+        assert!(check_eboot_sha(&m, None, other, false).is_err());
+    }
+
+    #[test]
+    fn eboot_matching_lock_hash_is_accepted() {
+        let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
+        let m = vec![us.to_string()];
+        assert!(check_eboot_sha(&m, Some(us), us, false).is_ok());
+    }
+
+    #[test]
+    fn eboot_conflicting_lock_hash_is_rejected_even_with_force() {
+        let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
+        let eu = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
+        let m = vec![us.to_string()];
+        let err = check_eboot_sha(&m, Some(eu), us, false).unwrap_err();
+        assert!(err.to_string().contains("regenerate"), "{err}");
+        assert!(check_eboot_sha(&m, Some(eu), us, true).is_err());
+    }
+
+    #[test]
+    fn eboot_lock_only_hash_is_accepted_when_manifest_is_empty() {
+        let eu = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
+        let other = "0000000000000000000000000000000000000000000000000000000000000000";
+        let m: Vec<String> = Vec::new();
+        assert!(check_eboot_sha(&m, Some(eu), eu, false).is_ok());
+        assert!(check_eboot_sha(&m, Some(eu), other, false).is_err());
     }
 }

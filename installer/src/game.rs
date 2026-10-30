@@ -302,7 +302,11 @@ mod tests {
 
     #[test]
     fn parses_the_us_param_sfo_identity() {
-        let d = make_sfo(&[("TITLE", "inFamous"), ("TITLE_ID", "BCUS98119"), ("APP_VER", "02.00")]);
+        let d = make_sfo(&[
+            ("TITLE", "inFamous"),
+            ("TITLE_ID", "BCUS98119"),
+            ("APP_VER", "02.00"),
+        ]);
         let m = parse_sfo(&d).unwrap();
         assert_eq!(m["TITLE_ID"], "BCUS98119");
         assert_eq!(m["APP_VER"], "02.00");
