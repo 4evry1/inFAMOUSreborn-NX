@@ -24,6 +24,7 @@ const DCBZ_NEW: &[u8] = b"ppu_dcbz128((uint32_t)ea)";
 const U_FFFD: &[u8] = b"\xef\xbf\xbd";
 const EM_DASH: &[u8] = b"\xe2\x80\x94";
 const EN_DASH: &[u8] = b"\xe2\x80\x93";
+const CP1252_DASH: &[u8] = b"\x97";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mech {
@@ -85,9 +86,12 @@ fn transform_dcbz(line: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn canonical(bytes: &[u8]) -> Vec<u8> {
-    let v = replace_all(bytes, U_FFFD, b"~");
-    let v = replace_all(&v, EM_DASH, b"~");
-    replace_all(&v, EN_DASH, b"~")
+    // Fold the dash family (UTF-8 em/en dash, U+FFFD, Windows-1252 0x97) onto a sentinel that
+    // never occurs in text, so unrelated '~' content is not treated as a dash.
+    let v = replace_all(bytes, U_FFFD, b"\x00");
+    let v = replace_all(&v, EM_DASH, b"\x00");
+    let v = replace_all(&v, EN_DASH, b"\x00");
+    replace_all(&v, CP1252_DASH, b"\x00")
 }
 
 fn encoding_noop(a: &[u8], b: &[u8]) -> bool {
@@ -217,6 +221,22 @@ pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut lines = lines_owned(base);
+
+    // Mechanical-map coverage: every distinct global mapping must apply to at least one US line,
+    // otherwise a mechanical transform is silently inapplicable (a genuine divergence or a bug).
+    {
+        let present: std::collections::HashSet<&[u8]> =
+            lines.iter().map(|l| l.as_slice()).collect();
+        for key in map.keys() {
+            if !present.contains(key.as_slice()) {
+                crate::bail!(
+                    "{}: mechanical mapping not present in the US file: {:?}",
+                    path,
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+    }
     for (idx, h) in residual.iter().enumerate() {
         let count = count_matches(&lines, &h.old);
         if count != 1 {
@@ -310,6 +330,23 @@ mod tests {
             mechanical(old.as_bytes(), new.as_bytes()),
             Some(Mech::Encoding)
         );
+    }
+
+    #[test]
+    fn cp1252_dash_is_a_comment_only_noop() {
+        let old = "/* trap \u{2014} ignored */\n";
+        let new = b"/* trap \x97 ignored */\n";
+        assert_eq!(mechanical(old.as_bytes(), new), Some(Mech::Encoding));
+        // An unrelated literal '~' must NOT be treated as a dash.
+        assert_eq!(mechanical(b"a ~ b\n", b"a \x97 b\n"), None);
+    }
+
+    #[test]
+    fn mechanical_mapping_not_in_us_base_is_rejected() {
+        // The patch maps a store line, but the US base does not contain it (register differs).
+        let (patch, _) = diff::make_patch(store("0").as_bytes(), stvx16("0").as_bytes(), "f", 1);
+        let err = reconcile_cpp("f", b"unrelated\n", &patch).unwrap_err();
+        assert!(err.to_string().contains("mechanical mapping not present"));
     }
 
     #[test]
