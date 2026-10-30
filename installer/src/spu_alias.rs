@@ -9,8 +9,8 @@
 use crate::hash;
 use crate::lock::Lock;
 use crate::util::{self, Ctx, Result};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 /// A single EU -> US group rename, e.g. `spu_0000_at_005F6500` -> `spu_0000_at_005F6000`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +269,70 @@ pub fn transform_patches(installer_dir: &Path, aliases: &Aliases) -> Result<()> 
     Ok(())
 }
 
+/// Snapshot every regular file under `installer/patches` keyed by its relative path, so a failed
+/// rebase can restore the committed patch tree exactly as it was.
+fn snapshot_patches(installer_dir: &Path) -> Result<HashMap<String, Vec<u8>>> {
+    let pdir = installer_dir.join("patches");
+    let files = util::walk_files(&pdir, &[], &|_| true)?;
+    let mut snapshot = HashMap::with_capacity(files.len());
+    for rel in files {
+        let path = util::join_slash(&pdir, &rel);
+        let bytes = std::fs::read(&path).ctx(|| format!("reading {}", path.display()))?;
+        snapshot.insert(rel, bytes);
+    }
+    Ok(snapshot)
+}
+
+/// Restore the committed patch tree from a `snapshot_patches` snapshot, removing anything
+/// `transform_patches` wrote in the meantime (renamed directories included).
+fn restore_patches(installer_dir: &Path, snapshot: &HashMap<String, Vec<u8>>) -> Result<()> {
+    let pdir = installer_dir.join("patches");
+    if pdir.exists() {
+        std::fs::remove_dir_all(&pdir).ctx(|| format!("removing {}", pdir.display()))?;
+    }
+    std::fs::create_dir_all(&pdir).ctx(|| format!("creating {}", pdir.display()))?;
+    for (rel, bytes) in snapshot {
+        util::write_file(&util::join_slash(&pdir, rel), bytes)?;
+    }
+    Ok(())
+}
+
+/// RAII guard around the in-place SPU patch transformation. If the rebase fails after
+/// `transform_patches` has mutated the committed tree, the snapshot is restored on drop; the
+/// caller disarms it only after the candidate lock has been validated and promoted.
+pub struct PatchTreeGuard {
+    installer_dir: PathBuf,
+    snapshot: HashMap<String, Vec<u8>>,
+    armed: bool,
+}
+
+impl PatchTreeGuard {
+    pub fn new(installer_dir: &Path) -> Result<Self> {
+        let snapshot = snapshot_patches(installer_dir)?;
+        Ok(Self {
+            installer_dir: installer_dir.to_path_buf(),
+            snapshot,
+            armed: true,
+        })
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PatchTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = restore_patches(&self.installer_dir, &self.snapshot) {
+                util::warn(&format!(
+                    "failed to restore the patch tree after a rebase error: {e}"
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +507,46 @@ mod tests {
         let remapped = aliases.remap_bytes(&patch);
         let out = diff::apply_patch(us_base.as_bytes(), &remapped).unwrap();
         assert_eq!(out, us_fin.as_bytes());
+    }
+
+    #[test]
+    fn patch_tree_guard_restores_on_error() {
+        let root = tempdir("guard");
+        let installer = root.join("installer");
+        let spu = installer
+            .join("patches")
+            .join("infamous-recomp")
+            .join("spu");
+        let dir = spu.join("spu_0000_at_005F6500");
+        std::fs::create_dir_all(&dir).unwrap();
+        let patch = dir.join("spu_recomp.c.patch");
+        std::fs::write(&patch, b"void spu_0000_at_005F6500_spu_func_0() {}\n").unwrap();
+        let manifest = installer.join("patches").join("manifest.json.patch");
+        std::fs::write(&manifest, b"spu_0000_at_005F6500\n").unwrap();
+
+        let aliases = Aliases {
+            groups: vec![Group {
+                index: 0,
+                eu: "spu_0000_at_005F6500".into(),
+                us: "spu_0000_at_005F6000".into(),
+            }],
+        };
+
+        let guard = PatchTreeGuard::new(&installer).unwrap();
+        transform_patches(&installer, &aliases).unwrap();
+        assert!(spu.join("spu_0000_at_005F6000").is_dir());
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"spu_0000_at_005F6000\n");
+
+        // A later failure (drop without disarming) restores the committed tree.
+        drop(guard);
+        assert!(dir.join("spu_recomp.c.patch").is_file());
+        assert!(!spu.join("spu_0000_at_005F6000").exists());
+        assert_eq!(
+            std::fs::read(&patch).unwrap(),
+            b"void spu_0000_at_005F6500_spu_func_0() {}\n"
+        );
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"spu_0000_at_005F6500\n");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

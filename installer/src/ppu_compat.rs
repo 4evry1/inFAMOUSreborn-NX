@@ -260,27 +260,56 @@ fn token_list(line: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn parse_hex_i64(seg: &[u8]) -> Option<i64> {
+/// A signed, arbitrary-width hex literal in canonical form: lowercase digits, no leading zeros
+/// (a single `0` for the value zero), and a sign flag that is only set for a nonzero negative.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HexLit {
+    negative: bool,
+    digits: Vec<u8>,
+}
+
+/// Parse a `scan_hex` token (`-?0x[0-9a-fA-F]+`) into a canonical `HexLit`. This is total over
+/// `scan_hex` output, so no literal is ever dropped for being too wide or for its sign.
+fn parse_hex_lit(seg: &[u8]) -> HexLit {
     let (neg, rest) = if seg.first() == Some(&b'-') {
         (true, &seg[1..])
     } else {
         (false, seg)
     };
-    if rest.len() < 3 || rest[0] != b'0' || (rest[1] != b'x' && rest[1] != b'X') {
-        return None;
+    let digits = &rest[2..];
+    let mut canonical: Vec<u8> = Vec::with_capacity(digits.len());
+    let mut started = false;
+    for &b in digits {
+        let d = (b as char)
+            .to_digit(16)
+            .expect("scan_hex emitted a non-hex digit");
+        let c = if d < 10 {
+            b'0' + d as u8
+        } else {
+            b'a' + (d - 10) as u8
+        };
+        if !started {
+            if d == 0 {
+                continue;
+            }
+            started = true;
+        }
+        canonical.push(c);
     }
-    let mut v: i64 = 0;
-    for &b in &rest[2..] {
-        let d = (b as char).to_digit(16)? as i64;
-        v = v.checked_mul(16)?.checked_add(d)?;
+    if !started {
+        canonical.push(b'0');
     }
-    Some(if neg { -v } else { v })
+    let negative = neg && canonical != b"0";
+    HexLit {
+        negative,
+        digits: canonical,
+    }
 }
 
-fn hex_values(line: &[u8]) -> Vec<i64> {
+fn hex_values(line: &[u8]) -> Vec<HexLit> {
     scan_hex(line)
         .into_iter()
-        .filter_map(|(s, e)| parse_hex_i64(&line[s..e]))
+        .map(|(s, e)| parse_hex_lit(&line[s..e]))
         .collect()
 }
 
@@ -448,31 +477,33 @@ fn rewrite_tokens(line: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
     out
 }
 
-fn format_like(seg: &[u8], target: i64) -> Vec<u8> {
-    let neg = seg.first() == Some(&b'-');
-    let prefix = if neg { 1 } else { 0 };
+fn format_hex_like(seg: &[u8], target: &HexLit) -> Vec<u8> {
+    let source_neg = seg.first() == Some(&b'-');
+    let prefix = if source_neg { 1 } else { 0 };
     let digits = &seg[prefix + 2..];
     let width = digits.len();
     let upper = digits.iter().any(|b| b.is_ascii_uppercase());
-    let abs = if target < 0 {
-        (target as i128).unsigned_abs()
-    } else {
-        target as u128
-    };
-    let mut s = format!("{:0width$X}", abs, width = width);
-    if !upper {
-        s = s.to_lowercase();
+
+    let mut body = Vec::with_capacity(width.max(target.digits.len()));
+    let pad = width.saturating_sub(target.digits.len());
+    body.extend(std::iter::repeat(b'0').take(pad));
+    body.extend_from_slice(&target.digits);
+    if upper {
+        for b in &mut body {
+            *b = b.to_ascii_uppercase();
+        }
     }
-    let mut out = Vec::new();
-    if target < 0 {
+
+    let mut out = Vec::with_capacity(body.len() + 3);
+    if target.negative {
         out.push(b'-');
     }
     out.extend_from_slice(b"0x");
-    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(&body);
     out
 }
 
-fn rewrite_hex(line: &[u8], map: &HashMap<i64, i64>) -> Vec<u8> {
+fn rewrite_hex(line: &[u8], map: &HashMap<HexLit, HexLit>) -> Vec<u8> {
     let hs = scan_hex(line);
     if hs.is_empty() {
         return line.to_vec();
@@ -482,12 +513,9 @@ fn rewrite_hex(line: &[u8], map: &HashMap<i64, i64>) -> Vec<u8> {
     for (s, e) in hs {
         out.extend_from_slice(&line[last..s]);
         let seg = &line[s..e];
-        if let Some(v) = parse_hex_i64(seg) {
-            if let Some(&t) = map.get(&v) {
-                out.extend_from_slice(&format_like(seg, t));
-            } else {
-                out.extend_from_slice(seg);
-            }
+        let v = parse_hex_lit(seg);
+        if let Some(t) = map.get(&v) {
+            out.extend_from_slice(&format_hex_like(seg, t));
         } else {
             out.extend_from_slice(seg);
         }
@@ -504,8 +532,8 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
         crate::bail!("{}: internal error: US window length mismatch", path);
     }
     let mut token_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut hex_map: HashMap<i64, i64> = HashMap::new();
-    let mut old_hex: HashSet<i64> = HashSet::new();
+    let mut hex_map: HashMap<HexLit, HexLit> = HashMap::new();
+    let mut old_hex: HashSet<HexLit> = HashSet::new();
     for (o, u) in h.old.iter().zip(us_win.iter()) {
         let ot = token_list(o);
         let ut = token_list(u);
@@ -539,12 +567,12 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
                 h.os
             );
         }
-        old_hex.extend(oh.iter().copied());
+        old_hex.extend(oh.iter().cloned());
         for (a, b) in oh.into_iter().zip(uh) {
             if a != b {
                 if let Some(prev) = hex_map.get(&a) {
                     if prev != &b {
-                        crate::bail!("{}: conflicting literal mapping for {:x}", path, a);
+                        crate::bail!("{}: conflicting literal mapping for {:?}", path, a);
                     }
                 }
                 hex_map.insert(a, b);
@@ -566,15 +594,14 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
             }
         }
         for (s, e) in scan_hex(line) {
-            if let Some(v) = parse_hex_i64(&line[s..e]) {
-                if !hex_map.contains_key(&v) && !old_hex.contains(&v) {
-                    crate::bail!(
-                        "{}: new-side literal {:?} (hunk at EU line {}) is region-derived but not covered by the hunk map",
-                        path,
-                        String::from_utf8_lossy(&line[s..e]),
-                        h.os
-                    );
-                }
+            let v = parse_hex_lit(&line[s..e]);
+            if !hex_map.contains_key(&v) && !old_hex.contains(&v) {
+                crate::bail!(
+                    "{}: new-side literal {:?} (hunk at EU line {}) is region-derived but not covered by the hunk map",
+                    path,
+                    String::from_utf8_lossy(&line[s..e]),
+                    h.os
+                );
             }
         }
         let r = rewrite_tokens(line, &token_map);
@@ -948,6 +975,28 @@ mod tests {
             msg.contains("region-derived") && msg.contains("not covered"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn high_bit_literal_mapping_is_covered_and_rewritten() {
+        // A literal above i64::MAX maps exactly and is rewritten with the source width/case.
+        let eu = b"uint64_t x = 0xFFFFFFFF00000000ULL;\n";
+        let fin = b"uint64_t x = 0xFFFFFFFF00000000ULL; /* hook */\n";
+        let (patch, _) = diff::make_patch(eu, fin, "f", 0);
+        let us = b"uint64_t x = 0xFFFFFFFF000000A0ULL;\n";
+        let out = reconcile_cpp("f", us, &patch).unwrap();
+        assert_eq!(out, b"uint64_t x = 0xFFFFFFFF000000A0ULL; /* hook */\n");
+    }
+
+    #[test]
+    fn high_bit_new_side_literal_uncovered_is_rejected() {
+        // A new-side-only high-bit literal that no map covers must fail closed.
+        let eu = b"x = 0x000000A0;\n";
+        let fin = b"x = 0x000000A0; y = 0xFFFFFFFF00000000ULL;\n";
+        let (patch, _) = diff::make_patch(eu, fin, "f", 0);
+        let us = b"x = 0x000000B0;\n";
+        let err = reconcile_cpp("f", us, &patch).unwrap_err();
+        assert!(err.to_string().contains("region-derived"), "{err}");
     }
 
     #[test]

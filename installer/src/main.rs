@@ -1134,11 +1134,15 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
 
     util::heading("Locating the US SPU group renames");
     let aliases = spu_alias::derive(&source, &fresh)?;
-    if !aliases.is_empty() {
+    let mut patch_guard = if aliases.is_empty() {
+        None
+    } else {
         util::info(&format!("groups: {}", aliases.describe()));
         util::heading("Relocating SPU group names in the patch set");
+        let guard = spu_alias::PatchTreeGuard::new(&s.installer_dir)?;
         spu_alias::transform_patches(&s.installer_dir, &aliases)?;
-    }
+        Some(guard)
+    };
 
     util::heading("Reconciling the PPU hand-edits onto the US lift");
     let ppu_files = [
@@ -1211,6 +1215,9 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
     std::fs::rename(&candidate_path, &s.installer_dir.join("generated.lock"))
         .ctx(|| "renaming the candidate lock into installer/generated.lock")?;
     util::info("installer/generated.lock updated; review the diff and commit it.");
+    if let Some(guard) = &mut patch_guard {
+        guard.disarm();
+    }
     Ok(())
 }
 
