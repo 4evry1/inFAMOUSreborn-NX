@@ -24,8 +24,8 @@ extern "C" unsigned char s_coh_bitmap[];
 extern "C" volatile int s_coh_armed;
 
 namespace infamous_clock_probe {
-// BCES00220: [TOC 0x78BFC0-0x7F08]=0x76959C,
-// [0x76959C-0x7FF8]=0x7BC650. func_00078AA0 updates this clock.
+// EU EBOOT (BCES00220) provenance; US addresses re-verified in Task 6:
+// [TOC 0x78BFC0-0x7F08]=0x76959C, [0x76959C-0x7FF8]=0x7BC650. func_00078AA0 updates this clock.
 constexpr uint32_t base = 0x7BC650;
 using Clock = std::chrono::steady_clock;
 static Clock::time_point start;
@@ -229,7 +229,7 @@ static void init()
     sim_on = e && !std::strcmp(e, "1");
     if (!sim_on && !(cap_fps >= 5.0 && cap_fps <= 240.0)) return;
     if (word(0x7840B8) != 0x76959C || word(0x7615A4) != base) {
-        std::fprintf(stderr, "[SIM-CLOCK] disabled: ELF clock layout differs from BCES00220\n");
+        std::fprintf(stderr, "[SIM-CLOCK] disabled: ELF clock layout differs from the expected EBOOT layout\n");
         return;
     }
     start = Clock::now();

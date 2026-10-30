@@ -296,8 +296,8 @@ impl App {
             payload_bytes: 0,
             load_error: None,
             title: "inFamous".into(),
-            title_ids: vec!["BCES00220".into()],
-            link_name: "Infamous (Europe) (Fr,De,Es,It,Nl)".into(),
+            title_ids: vec!["BCUS98119".into()],
+            link_name: "Infamous (USA) (En,Fr,Es) (v02.00)".into(),
             update_repo: None,
             update_branch: "main".into(),
             repaint,
@@ -678,7 +678,7 @@ impl App {
         card(ui, |ui| {
             ui.label(RichText::new("You will need").strong());
             for (t, d) in [
-                ("Your game", format!("A disc image (.iso) or game folder of {}, European release ({}).", self.title, self.title_ids.join(", "))),
+                ("Your game", format!("A disc image (.iso) or game folder of {}, US release ({}).", self.title, self.title_ids.join(", "))),
                 ("Disk space", format!("About {} free.", util::human_bytes(setup::space_needed(self.payload_bytes, 12 << 30)))),
                 ("Time", "The first build takes roughly 20 to 60 minutes, depending on your PC. It runs on its own.".into()),
             ] {

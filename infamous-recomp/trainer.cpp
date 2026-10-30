@@ -1,7 +1,8 @@
 /*
  * inFamous in-game trainer, game side.  See trainer.h for what works and rsx_ui_trainer.h for the overlay contract.
  *
- * Addresses (EBOOT BCES00220), all from earlier reverse engineering -- nothing new is assumed here:
+ * Addresses: EU EBOOT (BCES00220) provenance from earlier reverse engineering. This fork targets the
+ * US EBOOT (BCUS98119); the addresses are re-verified in Task 6. Nothing new is assumed here:
  *   player object   = [0x0091032C] (majority vote with 0x007BA080 / 0x007CCE30 / 0x008F7400 / 0x009136BC),
  *                     class 0x00727A28
  *   obj+0x750 / +0x754   f32 max / current health

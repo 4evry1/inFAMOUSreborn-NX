@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(inFamousRecomp
     VERSION 0.1.0
     LANGUAGES C CXX
-    DESCRIPTION "inFamous (BCES00220) static recompilation project"
+    DESCRIPTION "inFamous (BCUS98119) static recompilation project"
 )
 
 # ---------------------------------------------------------------------------

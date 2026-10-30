@@ -288,3 +288,20 @@ impl Manifest {
             && !crate::util::any_match(&self.gen_exclude, rel)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_pins_us_identity() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("infamous.toml");
+        let m = Manifest::load(&path).expect("load installer/infamous.toml");
+        assert_eq!(m.title_ids, vec!["BCUS98119".to_string()]);
+        assert_eq!(m.eboot_sha256.len(), 1);
+        assert_eq!(
+            m.link_name.as_deref(),
+            Some("Infamous (USA) (En,Fr,Es) (v02.00)")
+        );
+    }
+}

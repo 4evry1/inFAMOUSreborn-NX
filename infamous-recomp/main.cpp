@@ -199,7 +199,7 @@ static DWORD WINAPI frame_clock(LPVOID)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
     const char* title = getenv("PS3_TITLE");
-    if (!title || !*title) title = "inFamous (BCES00220)";
+    if (!title || !*title) title = "inFamous (BCUS98119)";
 
     int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
@@ -524,7 +524,7 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 }
 
 /* Double-clicking the exe passes no arguments. Find the disc dump next to the
- * port (<exe dir>\..\..\Infamous (Europe) (Fr,De,Es,It,Nl)\...\EBOOT.elf) and
+ * port (<exe dir>\..\..\Infamous (USA) (En,Fr,Es) (v02.00)\...\EBOOT.elf) and
  * apply the switches run.cmd sets, so the exe works on its own too. */
 static char g_default_elf[1024];
 static void set_default_env(const char* k, const char* v)
@@ -549,8 +549,8 @@ static const char* find_default_elf(const char* argv0)
     if (fslash > slash) slash = fslash;
     if (slash) *slash = 0; else strcpy(dir, ".");
     static const char* rel[] = {
-        "/../../Infamous (Europe) (Fr,De,Es,It,Nl)/PS3_GAME/USRDIR/EBOOT.elf",
-        "/../Infamous (Europe) (Fr,De,Es,It,Nl)/PS3_GAME/USRDIR/EBOOT.elf",
+        "/../../Infamous (USA) (En,Fr,Es) (v02.00)/PS3_GAME/USRDIR/EBOOT.elf",
+        "/../Infamous (USA) (En,Fr,Es) (v02.00)/PS3_GAME/USRDIR/EBOOT.elf",
     };
     for (const char* r : rel) {
         snprintf(g_default_elf, sizeof(g_default_elf), "%s%s", dir, r);

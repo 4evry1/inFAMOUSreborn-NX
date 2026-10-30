@@ -1,6 +1,6 @@
 # infamous-installer
 
-Builds the inFamous (BCES00220) PC port from the player's **own** copy of the game. The port's
+Builds the inFamous (BCUS98119) PC port from the player's **own** copy of the game. The port's
 repository holds no game code and no game data. The installer regenerates all of it from the
 player's dump, applies the port's patches, compiles it and writes a launcher.
 
@@ -16,7 +16,7 @@ cargo build --release
 
 You need:
 
-* **Your inFamous disc dump**: the folder that contains `PS3_GAME` (European release, BCES00220).
+* **Your inFamous disc dump**: the folder that contains `PS3_GAME` (US release, BCUS98119).
 * **Python 3.10+** from python.org, with "Add python.exe to PATH" ticked.
 * **Visual Studio 2022 Build Tools** with the *Desktop development with C++* workload and the
   *C++ Clang Compiler for Windows* component.
@@ -32,7 +32,7 @@ infamous-installer doctor          :: check the prerequisites only
 
 The installer runs these steps:
 
-1. It reads `PARAM.SFO` and refuses any game that isn't BCES00220.
+1. It reads `PARAM.SFO` and refuses any game that isn't BCUS98119.
 2. It decrypts `EBOOT.BIN` to `EBOOT.elf` with `rpcs3 --decrypt` if needed. You can also do this
    yourself in RPCS3 with *Utilities → Decrypt PS3 Binaries*.
 3. It checks the SHA-256 of `EBOOT.elf` against the version the port was made from.

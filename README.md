@@ -4,8 +4,8 @@
 > Only download the Setup from the [Releases page](https://github.com/whompay/inFAMOUSreborn/releases) here.
 > Forks are not supported, and bugs from forks won't be fixed.
 
-An unofficial native Windows port of **inFamous** (PlayStation 3, 2009, European
-release `BCES00220`). The game's PowerPC (PPU) and SPU code is statically
+An unofficial native Windows port of **inFamous** (PlayStation 3, 2009, US
+release `BCUS98119`). The game's PowerPC (PPU) and SPU code is statically
 recompiled to x86-64 C/C++ with [ps3recomp](https://github.com/sp00nznet/ps3recomp),
 so it runs as a normal Windows program rather than under an emulator.
 
@@ -35,7 +35,7 @@ Setup need one run of the new Setup on the same folder first.
 
 ## Requirements
 
-- Your own inFamous disc dump, European release (`BCES00220`).
+- Your own inFamous disc dump, US release (`BCUS98119`).
 - Windows 10 or 11 (64-bit) and a GPU with Direct3D 12 support.
 - A CPU with SSE4.1 (2008 or newer). On CPUs without AVX2 (Intel before 2013, Pentium/Celeron
   without AVX, AMD before 2015) Setup builds a slower compatibility version automatically.

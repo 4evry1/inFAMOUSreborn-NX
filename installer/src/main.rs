@@ -1,4 +1,4 @@
-//! infamous-installer: builds the inFamous (BCES00220) PC recompilation from the player's own
+//! infamous-installer: builds the inFamous (BCUS98119) PC recompilation from the player's own
 //! copy of the game. No game code or data ships with the port; this tool regenerates it.
 //!
 //!   infamous-installer                       interactive install (double-click)
@@ -1272,6 +1272,16 @@ mod tests {
     #[test]
     fn usage_lists_rebase_patches() {
         assert!(USAGE.contains("rebase-patches"));
+    }
+
+    #[test]
+    fn no_eu_identity_in_help_or_package_text() {
+        // The command-line help must not advertise the European release.
+        assert!(!USAGE.contains("BCES00220"));
+        assert!(!USAGE.contains("European release"));
+        assert!(!USAGE.contains("Infamous (Europe)"));
+        // Package metadata (what `cargo` and package managers show) must not either.
+        assert!(!env!("CARGO_PKG_DESCRIPTION").contains("BCES00220"));
     }
 
     #[test]

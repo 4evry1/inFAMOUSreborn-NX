@@ -2,6 +2,9 @@
  * v243K (from PR #25): the game language behind the in-game Settings menu's Language row (included once from stubs.cpp; inert unless PS3_LANG
  * names a language the game would not pick by itself).
  *
+ * This fork targets the US executable (BCUS98119). The EU (BCES00220) notes and addresses below are
+ * reverse-engineering provenance; their US equivalents are re-verified in Task 6.
+ *
  * RE (EU EBOOT, BCES00220): at boot the game (func_00089F80) works out which release it is by matching the title id
  * cellDiscGameGetBootDiscInfo reports against the 7 it knows: BCUS98119 (US), BCES00220, BCES00591, BCES00609,
  * BCAS20074, BCET00010 and BCET00220. Each release has the list of languages it ships, at 0x00720868: 7 x
