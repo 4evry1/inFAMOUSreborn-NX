@@ -28,6 +28,14 @@ namespace infamous_clock_probe {
 // The clock base is identical in both builds; the TOC and the data pointers shift -0x48 in the US lift:
 // [TOC 0x78BF78-0x7F08]=0x769554, [0x769554-0x7FF8]=0x7BC650. The once-per-frame update stores raw dt at base+0.
 constexpr uint32_t base = 0x7BC650;
+
+/* Pure layout predicate (no guest-memory access): the caller passes the two observed words.
+ * The repository test gate pins this exact expression, and the init() guard below keeps every
+ * address-specific feature fail-closed on mismatch. */
+constexpr bool clock_layout_matches(uint32_t toc_entry_word, uint32_t clock_ptr_word)
+{
+    return toc_entry_word == 0x769554 && clock_ptr_word == base;
+}
 using Clock = std::chrono::steady_clock;
 static Clock::time_point start;
 struct Change { uint32_t bits = 0, lr = 0; double time = 0; bool seen = false; };
@@ -229,7 +237,7 @@ static void init()
                             std::fprintf(stderr, "[FPSCAP] v150 F7 toggles a %.0f fps cap (starts OFF)\n", cap_fps); } }
     sim_on = e && !std::strcmp(e, "1");
     if (!sim_on && !(cap_fps >= 5.0 && cap_fps <= 240.0)) return;
-    if (word(0x784070) != 0x769554 || word(0x76155C) != base) {
+    if (!clock_layout_matches(word(0x784070), word(0x76155C))) {
         std::fprintf(stderr, "[SIM-CLOCK] disabled: ELF clock layout differs from the expected EBOOT layout\n");
         return;
     }

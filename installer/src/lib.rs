@@ -16,3 +16,6 @@ pub mod toml;
 pub mod toolchain;
 pub mod update;
 pub mod util;
+
+#[cfg(test)]
+mod title_probe;

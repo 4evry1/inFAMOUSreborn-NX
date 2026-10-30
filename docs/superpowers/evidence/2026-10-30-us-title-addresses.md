@@ -2,7 +2,9 @@
 
 Date: 2026-10-30
 
-Branch / HEAD: `us-version-adaptation` @ `b3ff1d9`.
+Branch: `us-version-adaptation`. Audit base (before Task 6 changes): `b3ff1d9`.
+Task 6 commits: round 1 `c8b2807` (constant corrections), round 2 (helper + test gate;
+final hash in `task-6-report.md`).
 
 ## Identity
 
@@ -62,10 +64,20 @@ pointer values; the clock base itself does not move.
 ## Changes
 
 - `infamous-recomp/stubs.cpp`: `PM_TOC = 0x0078BFC0u` → `0x0078BF78u`.
-- `infamous-recomp/infamous_clock_probe.h`: the fail-closed layout check is now
-  `word(0x784070) != 0x769554 || word(0x76155C) != base`; provenance comment updated.
-- `infamous-recomp/tools/verify_us_title_addrs.py`: new dependency-free regression
-  test that pins the US ELF ground truth and asserts the in-tree C++ constants.
+- `infamous-recomp/infamous_clock_probe.h`: extracted a pure, `constexpr`
+  `clock_layout_matches(toc_entry_word, clock_ptr_word)` predicate; the `init()` guard
+  fails closed via `if (!clock_layout_matches(word(0x784070), word(0x76155C)))`.
+- `installer/src/title_probe.rs` (new) + `installer/src/lib.rs`: a `cargo test` gate
+  that mirrors the predicate (truth table: match + both mismatch cases) and pins the
+  exact C++ source so an inverted comparison, a removed fail-closed `return;`, or a
+  stale EU `PM_TOC` literal fails the standard gate. Runs without the ELF.
+- `infamous-recomp/tools/verify_us_title_addrs.py`: now ELF-ground-truth only (local
+  acceptance test when the dump is present); source pinning moved to the Rust gate.
+
+The round-2 helper/gate was written test-first: the three source-pinning tests failed
+against the round-1 C++ (no helper, no `!clock_layout_matches(...)` guard, and a stale
+`0x0078BFC0` reference in the `PM_TOC` comment), then passed after the helper and the
+comment were corrected.
 
 ## Fail-closed status
 
@@ -92,6 +104,7 @@ pointer values; the clock base itself does not move.
 
 ## Test evidence
 
-- `python3 infamous-recomp/tools/verify_us_title_addrs.py` → PASS (exit 0).
-- `cargo test --manifest-path installer/Cargo.toml --no-default-features` → 70 passed
-  (59 lib + 11 bin), 0 failed.
+- `cargo test --manifest-path installer/Cargo.toml --no-default-features` → 76 passed
+  (65 lib — including the 6 `title_probe` tests — + 11 bin), 0 failed.
+- `python3 infamous-recomp/tools/verify_us_title_addrs.py` → PASS (exit 0; ELF ground
+  truth only, requires the local dump).

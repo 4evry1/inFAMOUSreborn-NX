@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Task 6 regression test: pin the US (BCUS98119) title-dependent runtime addresses.
+"""Task 6 local acceptance test: verify US (BCUS98119) ELF ground truth.
 
 Dependency-free (Python stdlib only). Verifies, against the decrypted US EBOOT.elf,
-the exact invariants the runtime probes depend on, and asserts the in-tree C++
-constants still match. Run from anywhere:
+the exact invariants the runtime probes depend on (language-list table, module TOC,
+clock-probe chain). Source-side constant/helper pinning lives in the standard
+repository gate (`cargo test`), which runs without the ELF; this script is the
+additional ELF-ground-truth check, run locally when the dump is present.
 
     python3 infamous-recomp/tools/verify_us_title_addrs.py [--elf path/to/EBOOT.elf]
 
-Exits non-zero if any invariant is wrong (e.g. a EU constant is reintroduced).
+Exits non-zero if any ELF invariant is wrong.
 """
 from __future__ import annotations
 
@@ -121,50 +123,18 @@ def check_elf(elf_path: str) -> list[str]:
     return errs
 
 
-def expect(needle: str, hay: str, what: str, errs: list[str]):
-    if needle not in hay:
-        errs.append(f"{what}: missing {needle!r}")
-
-
-def forbid(needle: str, hay: str, what: str, errs: list[str]):
-    if needle in hay:
-        errs.append(f"{what}: stale EU value {needle!r} still present")
-
-
-def check_sources() -> list[str]:
-    errs: list[str] = []
-    clock = open(os.path.join(REPO_ROOT, "infamous-recomp", "infamous_clock_probe.h")).read()
-    stubs = open(os.path.join(REPO_ROOT, "infamous-recomp", "stubs.cpp")).read()
-    lang = open(os.path.join(REPO_ROOT, "infamous-recomp", "infamous_lang.h")).read()
-
-    expect("word(0x784070)", clock, "clock probe TOC-entry check", errs)
-    expect("0x769554", clock, "clock probe TOC value", errs)
-    expect("word(0x76155C)", clock, "clock probe pointer check", errs)
-    expect("0x7BC650", clock, "clock probe base", errs)
-    forbid("0x7840B8", clock, "clock probe", errs)
-    forbid("0x7615A4", clock, "clock probe", errs)
-    forbid("0x76959C", clock, "clock probe", errs)
-
-    expect("PM_TOC = 0x0078BF78u", stubs, "stubs.cpp PM_TOC", errs)
-    forbid("PM_TOC = 0x0078BFC0u", stubs, "stubs.cpp PM_TOC", errs)
-
-    expect("LISTS = 0x00720868u", lang, "infamous_lang.h LISTS", errs)
-    expect("{ 3, 5, 1, 3, 3, 8, 9 }", lang, "infamous_lang.h SHIPPED_COUNT", errs)
-    return errs
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--elf", default=DEFAULT_ELF)
     args = ap.parse_args()
 
-    errs = check_elf(args.elf) + check_sources()
+    errs = check_elf(args.elf)
     if errs:
         print(f"FAIL ({len(errs)}):")
         for e in errs:
             print("  -", e)
         return 1
-    print("PASS: US title-dependent runtime addresses match the US EBOOT.elf and the in-tree constants.")
+    print("PASS: US EBOOT.elf matches the title-dependent runtime address ground truth.")
     return 0
 
 
