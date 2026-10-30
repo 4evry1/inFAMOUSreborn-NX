@@ -349,7 +349,16 @@ impl Session {
     }
 }
 
-/// Decide whether the measured `sha` is the release this port was built from.
+/// The install-time verdict for a measured EBOOT.elf SHA: accepted outright, or only proceeding
+/// because the caller overrode a mismatch with `--force`.
+#[derive(Debug, PartialEq, Eq)]
+enum EbootDecision {
+    Accepted,
+    AcceptedWithOverride,
+}
+
+/// Pure decision: classify the measured `sha` against the manifest pins and the lock pin, with no
+/// console output. `eboot_hash_check` is the presentation boundary (logging, warnings).
 ///
 /// The manifest (`[game].eboot_sha256`) is authoritative when it pins one or more hashes. A lock
 /// pin is accepted only when it matches one of the manifest's hashes (or, when the manifest pins
@@ -361,7 +370,7 @@ fn check_eboot_sha(
     lock_eboot: Option<&str>,
     sha: &str,
     force: bool,
-) -> Result<()> {
+) -> Result<EbootDecision> {
     if !manifest.is_empty() {
         if let Some(le) = lock_eboot {
             if !manifest.iter().any(|m| m == le) {
@@ -385,27 +394,32 @@ fn check_eboot_sha(
     };
 
     if !accepted.is_empty() && !accepted.iter().any(|a| *a == sha) {
-        let msg = format!(
-            "this EBOOT.elf is not the release this port was made from (expected {})",
+        if force {
+            return Ok(EbootDecision::AcceptedWithOverride);
+        }
+        bail!(
+            "this EBOOT.elf is not the release this port was made from (expected {}).\n    \
+             --force tries anyway; expect the patch step to fail.",
             accepted.join(", ")
         );
-        if !force {
-            bail!("{msg}.\n    --force tries anyway; expect the patch step to fail.");
-        }
-        util::warn(&msg);
     }
-    Ok(())
+    Ok(EbootDecision::Accepted)
 }
 
 fn eboot_hash_check(s: &Session, elf: &Path, lock: Option<&lock::Lock>) -> Result<String> {
     let sha = hash::sha256_file(elf)?;
     util::info(&format!("EBOOT.elf sha256 {sha}"));
-    check_eboot_sha(
+    let decision = check_eboot_sha(
         &s.m.eboot_sha256,
         lock.and_then(|l| l.eboot.as_deref()),
         &sha,
         s.o.force,
     )?;
+    if decision == EbootDecision::AcceptedWithOverride {
+        util::warn(
+            "this EBOOT.elf is not the release this port was made from; --force overrides the check (the patch step may fail).",
+        );
+    }
     Ok(sha)
 }
 
@@ -1265,7 +1279,10 @@ mod tests {
         let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
         let other = "0000000000000000000000000000000000000000000000000000000000000000";
         let m = vec![us.to_string()];
-        assert!(check_eboot_sha(&m, None, us, false).is_ok());
+        assert_eq!(
+            check_eboot_sha(&m, None, us, false).unwrap(),
+            EbootDecision::Accepted
+        );
         assert!(check_eboot_sha(&m, None, other, false).is_err());
     }
 
@@ -1273,7 +1290,10 @@ mod tests {
     fn eboot_matching_lock_hash_is_accepted() {
         let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
         let m = vec![us.to_string()];
-        assert!(check_eboot_sha(&m, Some(us), us, false).is_ok());
+        assert_eq!(
+            check_eboot_sha(&m, Some(us), us, false).unwrap(),
+            EbootDecision::Accepted
+        );
     }
 
     #[test]
@@ -1291,7 +1311,21 @@ mod tests {
         let eu = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
         let other = "0000000000000000000000000000000000000000000000000000000000000000";
         let m: Vec<String> = Vec::new();
-        assert!(check_eboot_sha(&m, Some(eu), eu, false).is_ok());
+        assert_eq!(
+            check_eboot_sha(&m, Some(eu), eu, false).unwrap(),
+            EbootDecision::Accepted
+        );
         assert!(check_eboot_sha(&m, Some(eu), other, false).is_err());
+    }
+
+    #[test]
+    fn eboot_mismatch_with_force_returns_accepted_with_override() {
+        let us = "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4";
+        let other = "0000000000000000000000000000000000000000000000000000000000000000";
+        let m = vec![us.to_string()];
+        assert_eq!(
+            check_eboot_sha(&m, None, other, true).unwrap(),
+            EbootDecision::AcceptedWithOverride
+        );
     }
 }
