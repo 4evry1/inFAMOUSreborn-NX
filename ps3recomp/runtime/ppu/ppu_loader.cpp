@@ -826,7 +826,10 @@ static DWORD WINAPI samp_thread(LPVOID p)
  * Writing the word leaves memory self-consistent: lwarx, the CAS and the
  * polling reader all see the same thing, so the guest behaves as it would if
  * whatever should have cleared the counter had done so. */
-extern "C" void ppu_resv_break(uint64_t ea);
+/* MSVC (and clang-cl) tolerate a declaration/definition linkage mismatch; GNU-mode
+ * clang (MinGW cross builds) does not. The definition below (line ~1080) is
+ * static inline, so declare it with the same internal linkage here. */
+static inline void ppu_resv_break(uint64_t ea);
 static DWORD WINAPI poke_thread(LPVOID p)
 {
     const uint32_t ea  = (uint32_t)(uintptr_t)p;

@@ -485,6 +485,20 @@ set(PORT_GAME_SOURCES
     trainer.cpp      # F10 in-game trainer (trainer.h)
 )
 
+# ---------------------------------------------------------------------------
+# US fork (Task 6/7): the trainer calls EU guest functions by symbol whose US
+# counterparts are not yet re-verified (Task 6 deferred it). Compile the trainer
+# out until the mapping is done; calling EU addresses into the US lift would
+# corrupt guest state. Remove this option (and the shims in stubs.cpp) once
+# the US trainer addresses are verified.
+# ---------------------------------------------------------------------------
+option(INFAMOUS_TRAINER_US_UNVERIFIED
+    "Disable the trainer until its EU guest addresses are re-verified for the US EBOOT" ON)
+if(INFAMOUS_TRAINER_US_UNVERIFIED)
+    list(FILTER PORT_GAME_SOURCES EXCLUDE REGEX "trainer\\.cpp$")
+    message(STATUS "Trainer:         disabled (EU guest addresses not yet re-verified for the US EBOOT)")
+endif()
+
 add_executable(${PROJECT_NAME}
     ${PORT_GAME_SOURCES}
     ${PS3RECOMP_SCAFFOLD}
@@ -670,7 +684,13 @@ if(PORT_CPU_COMPAT)
     endif()
 endif()
 if(WIN32)
-    target_link_options(${PROJECT_NAME} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/${_v242b_exe}.map")
+    # Same link map for the supported clang-cl route and the MinGW cross route;
+    # each driver takes its own spelling.
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE "/MAP:${CMAKE_BINARY_DIR}/${_v242b_exe}.map")
+    else()
+        target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/${_v242b_exe}.map")
+    endif()
 endif()
 # v242B PORT_CPU_CHECK (default ON): entry point v242b_entry (main.cpp) checks the CPU features BEFORE the C runtime
 # and static constructors run (AVX2 code there would crash an older CPU first) and starts inFamousRecomp_sse4.exe or
@@ -688,6 +708,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
     )
+    if(MINGW)
+        # clang-cl enables MS extensions implicitly; the MinGW driver needs the flag
+        # for the SEH __try/__except blocks in the PPU scaffold and runtime.
+        target_compile_options(${PROJECT_NAME} PRIVATE -fms-extensions)
+        if(TARGET ps3recomp_runtime)
+            target_compile_options(ps3recomp_runtime PRIVATE -fms-extensions)
+        endif()
+        message(STATUS "MinGW cross build: -fms-extensions (SEH __try/__except)")
+    endif()
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
         /W3 /wd4100 /wd4244 /wd4267
@@ -702,6 +731,10 @@ elseif(MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
+endif()
+
+if(INFAMOUS_TRAINER_US_UNVERIFIED)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE INFAMOUS_TRAINER_US_UNVERIFIED=1)
 endif()
 
 # The lifted translation units are machine-generated and can run to hundreds of

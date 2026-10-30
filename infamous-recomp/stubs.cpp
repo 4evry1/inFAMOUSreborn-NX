@@ -27,6 +27,36 @@ extern "C" { volatile float g_v237_lodf = 1.0f; }
 #include "ps3emu/error_codes.h"
 extern "C" uint8_t* vm_base;   /* C linkage: defined in main.cpp */
 
+#ifdef INFAMOUS_TRAINER_US_UNVERIFIED
+/* US fork (Task 7): trainer.cpp is compiled out until its EU guest addresses are re-verified
+ * for the US EBOOT (Task 6 follow-up). These shims keep the two trainer hooks this file
+ * references inert and log once. */
+extern "C" void infamous_trainer_install(void)
+{
+    static int s_trainer_said = 0;
+    if (!s_trainer_said++)
+        std::fprintf(stderr,
+                     "[TRAINER] disabled: EU guest addresses not yet re-verified "
+                     "for the US EBOOT (Task 6 follow-up)\n");
+}
+extern "C" int infamous_trainer_anim_hook(uint32_t anim_obj)
+{
+    (void)anim_obj;
+    return 0;
+}
+/* The lifted PPU code (func_002B4678) calls these Super Speed hooks unconditionally.
+ * With the trainer compiled out they are no-ops, which is exactly the guest flow
+ * before the trainer patch was applied. */
+extern "C" void infamous_trainer_move_pre(ppu_context* ctx)
+{
+    (void)ctx;
+}
+extern "C" void infamous_trainer_move_set(ppu_context* ctx)
+{
+    (void)ctx;
+}
+#endif
+
 extern "C" {
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);

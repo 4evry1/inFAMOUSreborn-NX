@@ -224,7 +224,13 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
  * Chosen ONCE per run (both models must never mix on one mutex): PS3_LWM_FAST=0 keeps
  * the semaphores. Not switchable by PS3_AB for the same reason. */
 #ifdef _WIN32
-#  pragma comment(lib, "Synchronization.lib")
+#  ifdef _MSC_VER
+     /* MSVC CRT: WaitOnAddress / WakeByAddressSingle live in Synchronization.lib.
+      * MinGW ships them in libsynchronization.a, which the toolkit CMake links
+      * explicitly for MinGW builds (the capital-S pragma does not resolve on
+      * case-sensitive Linux-hosted lld). */
+#    pragma comment(lib, "Synchronization.lib")
+#  endif
 #endif
 static int lwm_fast(void)
 {

@@ -177,6 +177,18 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    if(MINGW)
+        # WaitOnAddress / WakeByAddress* live in mingw's libsynchronization.a
+        # (MSVC's Synchronization.lib; the capital-S pragma does not resolve on
+        # case-sensitive Linux-hosted lld, so link the MinGW spelling here).
+        target_link_libraries(ps3recomp_runtime PRIVATE synchronization)
+        # The Windows SDK clang-cl builds against defaults _WIN32_WINNT to its
+        # maximum (0x0A00 via sdkddkver.h), while mingw-w64 defaults lower and
+        # hides the Win10 CPU-set APIs (GetSystemCpuSetInformation and friends)
+        # the D3D12 backend uses. Pin the same target version for MinGW only;
+        # the documented clang-cl build is unchanged.
+        target_compile_definitions(ps3recomp_runtime PUBLIC _WIN32_WINNT=0x0A00)
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
