@@ -230,6 +230,46 @@ pub fn carve(src: &Path, offset: u64, len: u64, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Build a minimal PARAM.SFO from string fields, matching the on-disc layout the parser reads
+    /// (header, 16-byte index entries, then key and data tables). Every value is a NUL-terminated
+    /// UTF-8 string (format 0x0204), including APP_VER, which the disc stores as text like "02.00".
+    fn make_sfo(entries: &[(&str, &str)]) -> Vec<u8> {
+        let n = entries.len() as u32;
+        let mut idx: Vec<u8> = Vec::new();
+        let mut keys: Vec<u8> = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+        let mut key_off = 0u16;
+        let mut data_off = 0u32;
+        for (k, v) in entries {
+            let kb = k.as_bytes();
+            let vb = v.as_bytes();
+            let len = vb.len() as u32 + 1;
+            idx.extend_from_slice(&key_off.to_le_bytes());
+            idx.extend_from_slice(&0x0204u16.to_le_bytes());
+            idx.extend_from_slice(&len.to_le_bytes());
+            idx.extend_from_slice(&len.to_le_bytes());
+            idx.extend_from_slice(&data_off.to_le_bytes());
+            key_off += kb.len() as u16 + 1;
+            data_off += len;
+            keys.extend_from_slice(kb);
+            keys.push(0);
+            data.extend_from_slice(vb);
+            data.push(0);
+        }
+        let key_tab = 20 + 16 * n;
+        let data_tab = key_tab + keys.len() as u32;
+        let mut d = Vec::new();
+        d.extend_from_slice(b"\0PSF");
+        d.extend_from_slice(&0x0101u32.to_le_bytes());
+        d.extend_from_slice(&key_tab.to_le_bytes());
+        d.extend_from_slice(&data_tab.to_le_bytes());
+        d.extend_from_slice(&n.to_le_bytes());
+        d.extend_from_slice(&idx);
+        d.extend_from_slice(&keys);
+        d.extend_from_slice(&data);
+        d
+    }
+
     #[test]
     fn sfo_roundtrip() {
         // Build a 2-entry SFO by hand.
@@ -258,5 +298,13 @@ mod tests {
         let m = parse_sfo(&d).unwrap();
         assert_eq!(m["TITLE"], "inFamous");
         assert_eq!(m["TITLE_ID"], "BCES00220");
+    }
+
+    #[test]
+    fn parses_the_us_param_sfo_identity() {
+        let d = make_sfo(&[("TITLE", "inFamous"), ("TITLE_ID", "BCUS98119"), ("APP_VER", "02.00")]);
+        let m = parse_sfo(&d).unwrap();
+        assert_eq!(m["TITLE_ID"], "BCUS98119");
+        assert_eq!(m["APP_VER"], "02.00");
     }
 }

@@ -19,12 +19,12 @@
 
 [game]
 title = "inFamous"
-title_ids = ["BCES00220"]
-# sha256 of the decrypted PS3_GAME/USRDIR/EBOOT.elf the port was built from (European disc).
-eboot_sha256 = ["095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd"]
+title_ids = ["BCUS98119"]
+# sha256 of the decrypted PS3_GAME/USRDIR/EBOOT.elf the port was built from (US disc, v02.00).
+eboot_sha256 = ["4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4"]
 # The port's tools (and run.cmd) look for the game at ../<this name>. The installer links the
 # player's dump there (a directory junction on Windows), wherever it really is.
-link_name = "Infamous (Europe) (Fr,De,Es,It,Nl)"
+link_name = "Infamous (USA) (En,Fr,Es) (v02.00)"
 
 [layout]
 port = "infamous-recomp"
