@@ -9,7 +9,7 @@
 //!   infamous-installer export --out <dir>    (maintainer) copy the publishable source tree
 
 use infamous_installer::{
-    bail, game, hash, iso, lock, manifest, payload, pipeline, toolchain, update, util,
+    bail, game, hash, iso, lock, manifest, payload, pipeline, rebase, toolchain, update, util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -26,6 +26,9 @@ USAGE
   infamous-installer update  [options]       get the latest version from GitHub (only the files that
                                              changed), then rebuild what that needs
   infamous-installer make-patches --game DIR (maintainers) rebuild installer/patches from your tree
+  infamous-installer rebase-patches --game DIR
+                                             (maintainers) rebase the port's patches onto the US
+                                             dump (BCUS98119) and promote a new generated.lock
   infamous-installer export --out DIR        (maintainers) copy the publishable source tree to DIR
   infamous-installer package --out FILE.exe  (maintainers) build the one-file setup program
   infamous-installer extract-iso --iso FILE --out DIR [--dkey FILE | --key HEX]
@@ -81,7 +84,14 @@ struct Opts {
 }
 
 fn parse_args() -> Result<Opts> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I>(args: I) -> Result<Opts>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
     // Double-click (no args) or a folder dropped onto the exe: keep the window open at the end.
     let dropped = args.len() == 1 && !args[0].starts_with('-') && Path::new(&args[0]).exists();
     let mut o = Opts {
@@ -98,8 +108,8 @@ fn parse_args() -> Result<Opts> {
     while i < args.len() {
         let a = args[i].clone();
         match a.as_str() {
-            "install" | "doctor" | "update" | "make-patches" | "export" | "package"
-            | "extract-iso" | "help"
+            "install" | "doctor" | "update" | "make-patches" | "rebase-patches" | "export"
+            | "package" | "extract-iso" | "help"
                 if o.cmd.is_empty() =>
             {
                 o.cmd = a
@@ -984,6 +994,137 @@ fn cmd_make_patches(s: &Session) -> Result<()> {
     Ok(())
 }
 
+/// Rebase the committed EU patch set onto a freshly generated US tree and, only when the
+/// candidate lock reproduces every file, atomically promote it over `installer/generated.lock`.
+fn cmd_rebase_patches(s: &Session) -> Result<()> {
+    println!(
+        "rebase-patches: rebase the existing patch set onto the US {} dump at {}",
+        s.m.game_title,
+        s.root.display()
+    );
+    if s.o.game.is_none() {
+        bail!("rebase-patches needs --game <folder that contains PS3_GAME>");
+    }
+
+    util::heading("Game files");
+    let g = s.game()?;
+    if g.title_id() != "BCUS98119" {
+        bail!(
+            "this command adapts the US release (BCUS98119), but the dump is {} [{}]",
+            g.title(),
+            g.title_id()
+        );
+    }
+    util::info(&format!(
+        "{} [{}] at {}",
+        g.title(),
+        g.title_id(),
+        g.root.display()
+    ));
+
+    let py = s.python()?;
+    util::heading("Executable");
+    let elf = s.eboot(&g, Some(&py))?;
+    let sha = hash::sha256_file(&elf)?;
+    util::info(&format!("EBOOT.elf sha256 {sha}"));
+
+    util::heading("Loading the current patch set");
+    let source = lock::Lock::load(&s.installer_dir.join("generated.lock"))?
+        .ctx(|| "installer/generated.lock is missing; run make-patches first")?;
+
+    let fresh = s.root.join(".installer").join("us").join("fresh");
+    if fresh.exists() {
+        util::info(&format!("Removing the previous {}", fresh.display()));
+        if let Some(l) = &s.m.link_name {
+            let link = fresh.join(l);
+            if std::fs::symlink_metadata(&link).is_ok() {
+                pipeline::remove_link(&link)?;
+            }
+        }
+        std::fs::remove_dir_all(&fresh).ctx(|| format!("removing {}", fresh.display()))?;
+    }
+    util::heading("Exporting a clean tree (what a player downloads)");
+    let (n, b) = pipeline::export_tree(&s.m, &s.root, &fresh)?;
+    util::info(&format!(
+        "{n} files, {} -> {}",
+        util::human_bytes(b),
+        fresh.display()
+    ));
+    if let Some(l) = &s.m.link_name {
+        pipeline::link_game(&fresh, l, &g.root)?;
+    }
+    let mut vars = pipeline::workspace_vars(&s.m, &fresh, &s.installer_dir);
+    pipeline::game_vars(&mut vars, &g, &elf);
+    vars.set_path("python", &py);
+    vars.set("jobs", s.jobs().to_string());
+
+    util::heading("Running the pipeline on the clean tree");
+    let failed = pipeline::run_steps(&s.m, &fresh, &vars, &sha, s.o.regen)?;
+    if !failed.is_empty() {
+        util::warn(&format!("optional steps failed: {}", failed.join(", ")));
+    }
+
+    util::heading("Rebasing the patch set onto the US tree");
+    let rebase::RebaseReport {
+        lock: candidate,
+        unchanged,
+        patched,
+        created,
+        removed,
+    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha)?;
+    util::info(&format!(
+        "{unchanged} unchanged, {patched} patched, {created} created, {removed} removed"
+    ));
+
+    let candidate_path = s.installer_dir.join("generated.lock.us-new");
+    candidate.save(&candidate_path)?;
+
+    util::heading("Applying the candidate lock and verifying it");
+    pipeline::apply_lock(&s.m, &fresh, &s.installer_dir, &candidate, &[])?;
+    if !pipeline::lock_satisfied(&fresh, &candidate)? {
+        bail!("the candidate lock did not reproduce every generated file");
+    }
+
+    write_rebase_report(s, &candidate, &sha, unchanged, patched, created, removed)?;
+
+    util::heading("Promoting the candidate lock");
+    std::fs::rename(&candidate_path, &s.installer_dir.join("generated.lock"))
+        .ctx(|| "renaming the candidate lock into installer/generated.lock")?;
+    util::info("installer/generated.lock updated; review the diff and commit it.");
+    Ok(())
+}
+
+/// Plain-text `.installer/rebase/report.txt`: the US EBOOT hash, the entry counts, and the
+/// base/final hash of every path in the candidate lock.
+fn write_rebase_report(
+    s: &Session,
+    candidate: &lock::Lock,
+    eboot_sha: &str,
+    unchanged: usize,
+    patched: usize,
+    created: usize,
+    removed: usize,
+) -> Result<()> {
+    let dir = s.root.join(".installer").join("rebase");
+    std::fs::create_dir_all(&dir).ctx(|| format!("creating {}", dir.display()))?;
+    let mut t = String::from("# inFamous US patch rebase\n");
+    t.push_str(&format!("eboot {eboot_sha}\n"));
+    t.push_str(&format!("files {}\n", candidate.files.len()));
+    t.push_str(&format!("unchanged {unchanged}\n"));
+    t.push_str(&format!("patched {patched}\n"));
+    t.push_str(&format!("created {created}\n"));
+    t.push_str(&format!("removed {removed}\n\n"));
+    for e in &candidate.files {
+        t.push_str(&format!(
+            "{} {} {}\n",
+            e.path,
+            e.base.as_deref().unwrap_or("-"),
+            e.fin.as_deref().unwrap_or("-")
+        ));
+    }
+    util::write_file(&dir.join("report.txt"), t.as_bytes())
+}
+
 fn cmd_export(s: &Session) -> Result<()> {
     let out = s.o.out.clone().ctx(|| "export needs --out <dir>")?;
     if out.exists()
@@ -1025,6 +1166,7 @@ fn real_main(o: Opts) -> Result<()> {
         "doctor" => cmd_doctor(&s),
         "update" => cmd_update(&s),
         "make-patches" => cmd_make_patches(&s),
+        "rebase-patches" => cmd_rebase_patches(&s),
         "export" => cmd_export(&s),
         "package" => cmd_package(&s),
         _ => unreachable!(),
@@ -1052,4 +1194,26 @@ fn main() {
         util::prompt("\nPress Enter to close this window.");
     }
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_rebase_patches_command() {
+        let o = parse_args_from(vec!["rebase-patches".into()]).unwrap();
+        assert_eq!(o.cmd, "rebase-patches");
+    }
+
+    #[test]
+    fn rebase_patches_does_not_silently_default_a_game() {
+        let o = parse_args_from(vec!["rebase-patches".into()]).unwrap();
+        assert!(o.game.is_none());
+    }
+
+    #[test]
+    fn usage_lists_rebase_patches() {
+        assert!(USAGE.contains("rebase-patches"));
+    }
 }
