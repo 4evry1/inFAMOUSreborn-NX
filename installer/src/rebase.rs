@@ -7,7 +7,7 @@ use crate::manifest::Manifest;
 use crate::pipeline::SKIP_DIRS;
 use crate::spu_alias::Aliases;
 use crate::util::{self, Ctx, Error, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -27,6 +27,7 @@ pub fn rebase_lock(
     source: &Lock,
     eboot_sha: &str,
     aliases: &Aliases,
+    patch_overrides: &HashMap<String, Vec<u8>>,
 ) -> Result<RebaseReport> {
     let known: BTreeSet<&str> = source
         .files
@@ -111,13 +112,17 @@ pub fn rebase_lock(
                 patch_path.display()
             );
         }
-        let patch = fs::read(&patch_path).ctx(|| {
-            format!(
-                "{}: reading patch {}",
-                source_entry.path,
-                patch_path.display()
-            )
-        })?;
+        let patch = if let Some(p) = patch_overrides.get(&us_path) {
+            p.clone()
+        } else {
+            fs::read(&patch_path).ctx(|| {
+                format!(
+                    "{}: reading patch {}",
+                    source_entry.path,
+                    patch_path.display()
+                )
+            })?
+        };
         let (base, old) = if source_entry.base.is_none() {
             (None, Vec::new())
         } else {
@@ -334,6 +339,7 @@ name = "inFamous"
             &source,
             &hash("us-eboot\n"),
             &Aliases::default(),
+            &HashMap::new(),
         )
         .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -353,6 +359,7 @@ name = "inFamous"
             &source,
             &hash("us-eboot\n"),
             &Aliases::default(),
+            &HashMap::new(),
         ) {
             Ok(_) => panic!("rebase unexpectedly returned a lock"),
             Err(error) => error.to_string(),
@@ -376,6 +383,7 @@ name = "inFamous"
             &source,
             &hash("us-eboot\n"),
             &Aliases::default(),
+            &HashMap::new(),
         ) {
             Ok(_) => panic!("rebase unexpectedly returned a lock"),
             Err(error) => error.to_string(),

@@ -510,7 +510,14 @@ fn cmd_install(s: &Session) -> Result<()> {
                 .filter(|st| failed.contains(&st.id))
                 .flat_map(|st| st.outputs.clone())
                 .collect();
-        pipeline::apply_lock(&s.m, &s.root, &s.installer_dir, &lock, &tolerate)?;
+        pipeline::apply_lock(
+            &s.m,
+            &s.root,
+            &s.installer_dir,
+            &lock,
+            &tolerate,
+            &std::collections::HashMap::new(),
+        )?;
         let state_path = s.root.join(".installer").join("state");
         let mut st = lock::State::load(&state_path);
         st.applied = true;
@@ -1139,7 +1146,8 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         "ppu_recomp_003.cpp",
         "ppu_recomp_004.cpp",
     ];
-    let mut ppu_patches: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut ppu_overrides: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
     for name in ppu_files {
         let rel = format!("infamous-recomp/recompiled/{name}");
         let base_path = util::join_slash(&fresh, &rel);
@@ -1148,11 +1156,7 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         let patch = std::fs::read(&patch_path).ctx(|| format!("reading {}", patch_path.display()))?;
         let fin = ppu_compat::reconcile(&rel, &base, &patch, name == "ppu_recomp.h")?;
         let (us_patch, _) = diff::make_patch(&base, &fin, &rel, 3);
-        ppu_patches.push((rel, us_patch));
-    }
-    for (rel, us_patch) in &ppu_patches {
-        let patch_path = util::join_slash(&s.installer_dir, &format!("patches/{rel}.patch"));
-        util::write_file(&patch_path, us_patch)?;
+        ppu_overrides.insert(rel, us_patch);
     }
 
     util::heading("Rebasing the patch set onto the US tree");
@@ -1162,7 +1166,7 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         patched,
         created,
         removed,
-    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha, &aliases)?;
+    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha, &aliases, &ppu_overrides)?;
     util::info(&format!(
         "{unchanged} unchanged, {patched} patched, {created} created, {removed} removed"
     ));
@@ -1171,9 +1175,15 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
     candidate.save(&candidate_path)?;
 
     util::heading("Applying the candidate lock and verifying it");
-    pipeline::apply_lock(&s.m, &fresh, &s.installer_dir, &candidate, &[])?;
+    pipeline::apply_lock(&s.m, &fresh, &s.installer_dir, &candidate, &[], &ppu_overrides)?;
     if !pipeline::lock_satisfied(&fresh, &candidate)? {
         bail!("the candidate lock did not reproduce every generated file");
+    }
+
+    util::heading("Promoting the US-specific PPU patches");
+    for (rel, us_patch) in &ppu_overrides {
+        let patch_path = util::join_slash(&s.installer_dir, &format!("patches/{rel}.patch"));
+        util::write_file(&patch_path, us_patch)?;
     }
 
     write_rebase_report(s, &candidate, &sha, unchanged, patched, created, removed)?;

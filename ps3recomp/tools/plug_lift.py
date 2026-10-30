@@ -34,7 +34,7 @@ CTX_RESTORE = bytes.fromhex(''.join('30ff%02x%02x' % (0x38 + 2 * r, r) for r in 
 CTX_SAVE = bytes.fromhex(''.join('20ff%02x%02x' % (0x38 + 2 * r, r) for r in range(76)) + '35002780')
 FIXED = [
     # (name, LS org, bytes-source, extra starts)
-    ('pmA2C', 0xA2C, ('eboot', 0x68C380 + 0xA2C, 0x64), ()),
+    ('pmA2C', 0xA2C, ('eboot', 0x68BE80 + 0xA2C, 0x64), ()),
     ('ctxrest', 0x3FEC0, ('const', None, None), ()),
     ('ctxsave', 0x3FEC0, ('const2', None, None), ()),
 ]

@@ -98,13 +98,14 @@ id = "spu-images"
 title = "Extract the embedded SPU programs"
 run = ["{python}", "{toolkit}/tools/extract_spu_images.py", "{elf}", "--output", "{port}/spu-images"]
 
-# The WWS job manager policy module: 0x2D80 bytes at file offset 0x68CD80 of this EBOOT, loaded
+# The WWS job manager policy module: 0x2D80 bytes at file offset 0x68C880 of this US EBOOT
+# (the EU EBOOT had it at 0x68CD80; the byte-identical module shifted -0x500), loaded
 # at LS 0xA00 with its entry at 0x2BF0. (Verified byte-identical to the port's pm_wwsjob.raw/.elf.)
 [[step]]
 id = "pm-carve"
 title = "Extract the WWS job manager policy module"
 builtin = "carve"
-args = ["{elf}", "0x68CD80", "0x2D80", "{port}/spu-images/pm_wwsjob.raw"]
+args = ["{elf}", "0x68C880", "0x2D80", "{port}/spu-images/pm_wwsjob.raw"]
 
 [[step]]
 id = "pm-wrap"

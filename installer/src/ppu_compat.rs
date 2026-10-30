@@ -1,20 +1,22 @@
 //! Rebase the EU PPU hand-edits onto the US lift.
 //!
-//! The US and EU PPU code share the same lifted-code shapes but their function addresses differ,
-//! so the EU patches cannot be applied line-for-line. The edits split into three classes:
+//! The US and EU PPU code share lifted-code shapes but their function addresses differ, so the EU
+//! patches cannot be applied line-for-line. Edits are split into:
 //!   * global mechanical transforms -- `memcpy(vm_base + (uint32_t)ea, &ctx->vr[N], 16)` ->
 //!     `ppu_stvx16((uint32_t)ea, &ctx->vr[N])`, and `memset(vm_base + (uint32_t)ea, 0, 128)` ->
 //!     `ppu_dcbz128((uint32_t)ea)` -- applied by exact whole-line replacement;
-//!   * encoding-only no-ops (em/en dash <-> U+FFFD), which are skipped;
-//!   * residual context-specific hunks, applied only where their whole old side has a unique exact
-//!     match in the US file, otherwise a hard stop.
+//!   * encoding-only no-ops (UTF-8 em/en dash, U+FFFD, Windows-1252 `0x97`), which are skipped;
+//!   * residual context-specific hunks resolved in tiers -- byte-exact, then exact
+//!     `func_/loc_XXXXXXXX` token normalization with output token rewriting, then additionally
+//!     `-?0x...` literal normalization with output literal rewriting, and finally order-consistent
+//!     interpolation (EU hunk-header position through resolved anchors) for ambiguous candidates.
 //!
 //! The header patch is a pure-insertion patch whose hunk lines carry CRLF; its line endings are
 //! normalized to the US file's LF form and it is applied through the strict diff engine.
 
 use crate::diff;
-use crate::util::{Error, Result};
-use std::collections::HashMap;
+use crate::util::{self, Error, Result};
+use std::collections::{HashMap, HashSet};
 
 const STORE_HEAD: &[u8] = b"memcpy(vm_base + (uint32_t)ea, &ctx->vr[";
 const STORE_TAIL: &[u8] = b"], 16)";
@@ -58,8 +60,6 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Replace exactly one `memcpy(vm_base + (uint32_t)ea, &ctx->vr[N], 16)` store with the
-/// `ppu_stvx16` call. Returns None when the line has no unambiguous single store site.
 fn transform_store(line: &[u8]) -> Option<Vec<u8>> {
     let i = find_sub(line, STORE_HEAD)?;
     let j = find_sub(&line[i..], STORE_TAIL)?;
@@ -86,8 +86,6 @@ fn transform_dcbz(line: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn canonical(bytes: &[u8]) -> Vec<u8> {
-    // Fold the dash family (UTF-8 em/en dash, U+FFFD, Windows-1252 0x97) onto a sentinel that
-    // never occurs in text, so unrelated '~' content is not treated as a dash.
     let v = replace_all(bytes, U_FFFD, b"\x00");
     let v = replace_all(&v, EM_DASH, b"\x00");
     let v = replace_all(&v, EN_DASH, b"\x00");
@@ -98,8 +96,6 @@ fn encoding_noop(a: &[u8], b: &[u8]) -> bool {
     a != b && canonical(a) == canonical(b)
 }
 
-/// Classify an old->new line pair. Only unambiguous, semantically exact mechanical transforms are
-/// accepted; everything else is left for residual context matching.
 fn mechanical(old: &[u8], new: &[u8]) -> Option<Mech> {
     if encoding_noop(old, new) {
         return Some(Mech::Encoding);
@@ -114,6 +110,7 @@ fn mechanical(old: &[u8], new: &[u8]) -> Option<Mech> {
 }
 
 struct HunkOwned {
+    os: usize,
     old: Vec<Vec<u8>>,
     new: Vec<Vec<u8>>,
     dels: Vec<Vec<u8>>,
@@ -126,6 +123,7 @@ fn parse_hunks(patch: &[u8]) -> Result<Vec<HunkOwned>> {
     let mut out = Vec::new();
     for h in raw {
         let mut owned = HunkOwned {
+            os: h.old_start,
             old: Vec::new(),
             new: Vec::new(),
             dels: Vec::new(),
@@ -157,30 +155,464 @@ fn lines_owned(data: &[u8]) -> Vec<Vec<u8>> {
     diff::split_lines(data).iter().map(|l| l.to_vec()).collect()
 }
 
-fn count_matches(lines: &[Vec<u8>], seq: &[Vec<u8>]) -> usize {
-    if seq.is_empty() {
-        return 0;
-    }
-    lines.windows(seq.len()).filter(|w| *w == seq).count()
+fn is_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn find_match(lines: &[Vec<u8>], seq: &[Vec<u8>]) -> Option<usize> {
-    if seq.is_empty() {
+/// Byte ranges of `func_XXXXXXXX` / `loc_XXXXXXXX` tokens (exactly 8 hex digits, identifier
+/// boundaries on both sides).
+fn scan_tokens(line: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        let pfx = if line[i..].starts_with(b"func_") {
+            5
+        } else if line[i..].starts_with(b"loc_") {
+            4
+        } else {
+            0
+        };
+        if pfx > 0 {
+            let s = i + pfx;
+            let before_ok = i == 0 || !is_ident(line[i - 1]);
+            if before_ok
+                && s + 8 <= line.len()
+                && line[s..s + 8].iter().all(|&b| b.is_ascii_hexdigit())
+                && (s + 8 == line.len() || !is_ident(line[s + 8]))
+            {
+                out.push((i, s + 8));
+                i = s + 8;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte ranges of `-?0x[0-9A-Fa-f]+` literals.
+fn scan_hex(line: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        let start = i;
+        let mut j = i;
+        if line[j] == b'-' {
+            j += 1;
+        }
+        if j + 2 <= line.len() && line[j] == b'0' && (line[j + 1] == b'x' || line[j + 1] == b'X') {
+            let s = j + 2;
+            let mut e = s;
+            while e < line.len() && line[e].is_ascii_hexdigit() {
+                e += 1;
+            }
+            if e > s && (start == 0 || !is_ident(line[start - 1])) {
+                out.push((start, e));
+                i = e;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn norm_tokens(line: &[u8]) -> Vec<u8> {
+    let toks = scan_tokens(line);
+    if toks.is_empty() {
+        return line.to_vec();
+    }
+    let mut out = Vec::with_capacity(line.len());
+    let mut last = 0;
+    for (s, e) in toks {
+        out.extend_from_slice(&line[last..s]);
+        if line[s..].starts_with(b"func_") {
+            out.extend_from_slice(b"func_XXXXXXXX");
+        } else {
+            out.extend_from_slice(b"loc_XXXXXXXX");
+        }
+        last = e;
+    }
+    out.extend_from_slice(&line[last..]);
+    out
+}
+
+fn norm_hex(line: &[u8]) -> Vec<u8> {
+    let hs = scan_hex(line);
+    if hs.is_empty() {
+        return line.to_vec();
+    }
+    let mut out = Vec::with_capacity(line.len());
+    let mut last = 0;
+    for (s, e) in hs {
+        out.extend_from_slice(&line[last..s]);
+        out.extend_from_slice(b"0xH");
+        last = e;
+    }
+    out.extend_from_slice(&line[last..]);
+    out
+}
+
+fn token_list(line: &[u8]) -> Vec<Vec<u8>> {
+    scan_tokens(line)
+        .into_iter()
+        .map(|(s, e)| line[s..e].to_vec())
+        .collect()
+}
+
+fn parse_hex_i64(seg: &[u8]) -> Option<i64> {
+    let (neg, rest) = if seg.first() == Some(&b'-') {
+        (true, &seg[1..])
+    } else {
+        (false, seg)
+    };
+    if rest.len() < 3 || rest[0] != b'0' || (rest[1] != b'x' && rest[1] != b'X') {
         return None;
     }
-    lines.windows(seq.len()).position(|w| w == seq)
+    let mut v: i64 = 0;
+    for &b in &rest[2..] {
+        let d = (b as char).to_digit(16)? as i64;
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(if neg { -v } else { v })
 }
 
-/// Insert an old -> new mechanical mapping, rejecting a conflicting mapping (the same old line
-/// already mapped to a different new line).
+fn hex_values(line: &[u8]) -> Vec<i64> {
+    scan_hex(line)
+        .into_iter()
+        .filter_map(|(s, e)| parse_hex_i64(&line[s..e]))
+        .collect()
+}
+
+fn find_seq(lines: &[Vec<u8>], seq: &[Vec<u8>]) -> Vec<usize> {
+    if seq.is_empty() || seq.len() > lines.len() {
+        return Vec::new();
+    }
+    lines
+        .windows(seq.len())
+        .enumerate()
+        .filter(|(_, w)| *w == seq)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn curated_alias(tok: &[u8]) -> Option<&'static [u8]> {
+    match tok {
+        b"loc_001850EC" => Some(b"loc_001855EC"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tier {
+    Exact,
+    Tokens,
+    Hex,
+    Interp,
+}
+
+struct Resolved {
+    us: usize,
+    _tier: Tier,
+}
+
+fn resolve_residual(
+    path: &str,
+    residual: &[&HunkOwned],
+    us_lines: &[Vec<u8>],
+) -> Result<Vec<Option<Resolved>>> {
+    let us2: Vec<Vec<u8>> = us_lines.iter().map(|l| norm_tokens(l)).collect();
+    let us3: Vec<Vec<u8>> = us2.iter().map(|l| norm_hex(l)).collect();
+    let mut resolved: Vec<Option<Resolved>> = (0..residual.len()).map(|_| None).collect();
+    let mut anchors: Vec<(usize, usize)> = Vec::new();
+    let mut ambiguous: Vec<(usize, Vec<usize>)> = Vec::new();
+
+    for (ri, h) in residual.iter().enumerate() {
+        let h = *h;
+        let m1 = find_seq(us_lines, &h.old);
+        if m1.len() == 1 {
+            resolved[ri] = Some(Resolved { us: m1[0], _tier: Tier::Exact });
+            anchors.push((h.os, m1[0]));
+            continue;
+        }
+        let old2: Vec<Vec<u8>> = h.old.iter().map(|l| norm_tokens(l)).collect();
+        let m2 = find_seq(&us2, &old2);
+        if m2.len() == 1 {
+            resolved[ri] = Some(Resolved { us: m2[0], _tier: Tier::Tokens });
+            anchors.push((h.os, m2[0]));
+            continue;
+        }
+        let old3: Vec<Vec<u8>> = old2.iter().map(|l| norm_hex(l)).collect();
+        let m3 = find_seq(&us3, &old3);
+        if m3.len() == 1 {
+            resolved[ri] = Some(Resolved { us: m3[0], _tier: Tier::Hex });
+            anchors.push((h.os, m3[0]));
+            continue;
+        }
+        ambiguous.push((ri, m3));
+    }
+
+    anchors.sort();
+    for (ri, cands) in ambiguous {
+        if cands.is_empty() {
+            crate::bail!(
+                "{}: residual hunk {} (EU line {}) has 0 candidate matches at every tier",
+                path,
+                ri + 1,
+                residual[ri].os
+            );
+        }
+        let eu = residual[ri].os;
+        let prev = anchors.iter().rev().find(|(e, _)| *e < eu).copied();
+        let next = anchors.iter().find(|(e, _)| *e > eu).copied();
+        if prev.is_none() && next.is_none() && cands.len() > 1 {
+            crate::bail!(
+                "{}: residual hunk {} (EU line {}) is ambiguous ({} candidates) and has no resolved anchors",
+                path,
+                ri + 1,
+                eu,
+                cands.len()
+            );
+        }
+        let exp: i64 = match (prev, next) {
+            (Some((pe, pu)), Some((ne, nu))) if ne != pe => {
+                pu as i64 + (eu as i64 - pe as i64) * (nu as i64 - pu as i64) / (ne as i64 - pe as i64)
+            }
+            (Some((pe, pu)), _) => pu as i64 + (eu as i64 - pe as i64),
+            (_, Some((ne, nu))) => nu as i64 - (ne as i64 - eu as i64),
+            _ => cands[0] as i64,
+        };
+        let order: Vec<usize> = cands
+            .iter()
+            .copied()
+            .filter(|&c| prev.map_or(true, |(_, pu)| c > pu) && next.map_or(true, |(_, nu)| c < nu))
+            .collect();
+        let pool = if order.is_empty() { cands.clone() } else { order };
+        let mut sorted = pool.clone();
+        sorted.sort_by_key(|&c| ((c as i64 - exp).abs(), c));
+        if sorted.len() >= 2
+            && (sorted[0] as i64 - exp).abs() == (sorted[1] as i64 - exp).abs()
+        {
+            crate::bail!(
+                "{}: residual hunk {} (EU line {}) is ambiguous: {} normalized candidates, tie at US line {}",
+                path,
+                ri + 1,
+                eu,
+                cands.len(),
+                sorted[0]
+            );
+        }
+        let choice = sorted[0];
+        resolved[ri] = Some(Resolved { us: choice, _tier: Tier::Interp });
+        anchors.push((eu, choice));
+        anchors.sort();
+    }
+    Ok(resolved)
+}
+
+fn rewrite_tokens(line: &[u8], map: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let toks = scan_tokens(line);
+    if toks.is_empty() {
+        return line.to_vec();
+    }
+    let mut out = Vec::with_capacity(line.len());
+    let mut last = 0;
+    for (s, e) in toks {
+        out.extend_from_slice(&line[last..s]);
+        let tok = &line[s..e];
+        if let Some(v) = map.get(tok) {
+            out.extend_from_slice(v);
+        } else if let Some(v) = curated_alias(tok) {
+            out.extend_from_slice(v);
+        } else {
+            out.extend_from_slice(tok);
+        }
+        last = e;
+    }
+    out.extend_from_slice(&line[last..]);
+    out
+}
+
+fn format_like(seg: &[u8], target: i64) -> Vec<u8> {
+    let neg = seg.first() == Some(&b'-');
+    let prefix = if neg { 1 } else { 0 };
+    let digits = &seg[prefix + 2..];
+    let width = digits.len();
+    let upper = digits.iter().any(|b| b.is_ascii_uppercase());
+    let abs = if target < 0 {
+        (target as i128).unsigned_abs()
+    } else {
+        target as u128
+    };
+    let mut s = format!("{:0width$X}", abs, width = width);
+    if !upper {
+        s = s.to_lowercase();
+    }
+    let mut out = Vec::new();
+    if target < 0 {
+        out.push(b'-');
+    }
+    out.extend_from_slice(b"0x");
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+fn rewrite_hex(line: &[u8], map: &HashMap<i64, i64>) -> Vec<u8> {
+    let hs = scan_hex(line);
+    if hs.is_empty() {
+        return line.to_vec();
+    }
+    let mut out = Vec::with_capacity(line.len());
+    let mut last = 0;
+    for (s, e) in hs {
+        out.extend_from_slice(&line[last..s]);
+        let seg = &line[s..e];
+        if let Some(v) = parse_hex_i64(seg) {
+            if let Some(&t) = map.get(&v) {
+                out.extend_from_slice(&format_like(seg, t));
+            } else {
+                out.extend_from_slice(seg);
+            }
+        } else {
+            out.extend_from_slice(seg);
+        }
+        last = e;
+    }
+    out.extend_from_slice(&line[last..]);
+    out
+}
+
+/// Build the token/literal maps from the matched US window, rewrite the hunk's new side, and
+/// require every EU `func_`/`loc_` token on the new side to be covered.
+fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    if us_win.len() != h.old.len() {
+        crate::bail!("{}: internal error: US window length mismatch", path);
+    }
+    let mut token_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut hex_map: HashMap<i64, i64> = HashMap::new();
+    for (o, u) in h.old.iter().zip(us_win.iter()) {
+        let ot = token_list(o);
+        let ut = token_list(u);
+        if ot.len() != ut.len() {
+            crate::bail!(
+                "{}: token count mismatch in hunk at EU line {} ({} vs {})",
+                path,
+                h.os,
+                ot.len(),
+                ut.len()
+            );
+        }
+        for (a, b) in ot.into_iter().zip(ut) {
+            if let Some(prev) = token_map.get(&a) {
+                if prev != &b {
+                    crate::bail!("{}: conflicting token mapping for {:?}", path, String::from_utf8_lossy(&a));
+                }
+            }
+            token_map.insert(a, b);
+        }
+        let oh = hex_values(o);
+        let uh = hex_values(u);
+        if oh.len() != uh.len() {
+            crate::bail!(
+                "{}: literal count mismatch in hunk at EU line {}",
+                path,
+                h.os
+            );
+        }
+        for (a, b) in oh.into_iter().zip(uh) {
+            if a != b {
+                if let Some(prev) = hex_map.get(&a) {
+                    if prev != &b {
+                        crate::bail!("{}: conflicting literal mapping for {:x}", path, a);
+                    }
+                }
+                hex_map.insert(a, b);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(h.new.len());
+    for line in &h.new {
+        for (s, e) in scan_tokens(line) {
+            let tok = &line[s..e];
+            if !token_map.contains_key(tok) && curated_alias(tok).is_none() {
+                crate::bail!(
+                    "{}: new-side token {:?} (hunk at EU line {}) is not covered by the hunk map",
+                    path,
+                    String::from_utf8_lossy(tok),
+                    h.os
+                );
+            }
+        }
+        let r = rewrite_tokens(line, &token_map);
+        out.push(rewrite_hex(&r, &hex_map));
+    }
+    Ok(out)
+}
+
+/// The store signature: `(address expression, vr index)` for a store line, used to decide whether
+/// an absent mechanical mapping leaves a plausible same-register raw store.
+fn store_signature(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let a = find_sub(line, b"uint64_t ea = ")?;
+    let rest = &line[a + b"uint64_t ea = ".len()..];
+    let end = find_sub(rest, b" & ~0xFULL")?;
+    let addr = rest[..end].to_vec();
+    let v = find_sub(line, b"&ctx->vr[")?;
+    let reg = &line[v + b"&ctx->vr[".len()..];
+    let close = find_sub(reg, b"]")?;
+    Some((addr, reg[..close].to_vec()))
+}
+
+/// Mechanical-map coverage. A complete old line absent from the US lift is `not applicable` unless
+/// a plausible same-register raw store exists (partial match) or the same line appears in multiple
+/// forms (ambiguous) -- those still hard-fail.
+fn check_mechanical_coverage(
+    path: &str,
+    map: &HashMap<Vec<u8>, Vec<u8>>,
+    us_lines: &[Vec<u8>],
+) -> Result<usize> {
+    let present: HashSet<&[u8]> = us_lines.iter().map(|l| l.as_slice()).collect();
+    let mut not_applicable = 0;
+    for key in map.keys() {
+        if present.contains(key.as_slice()) {
+            continue;
+        }
+        if let Some((addr, reg)) = store_signature(key) {
+            let needle_tail = b"memcpy(vm_base + (uint32_t)ea, &ctx->vr[";
+            let partial: Vec<&Vec<u8>> = us_lines
+                .iter()
+                .filter(|l| {
+                    store_signature(l)
+                        .map(|(a2, r2)| a2 == addr && r2 == reg)
+                        .unwrap_or(false)
+                        && find_sub(l, needle_tail).is_some()
+                })
+                .collect();
+            if !partial.is_empty() {
+                crate::bail!(
+                    "{}: mechanical mapping has a plausible same-register raw store but is not byte-identical: {:?}",
+                    path,
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
+        util::info(&format!(
+            "not applicable (no US counterpart): {}",
+            String::from_utf8_lossy(key).trim_end()
+        ));
+        not_applicable += 1;
+    }
+    Ok(not_applicable)
+}
+
 fn insert_mapping(
+    path: &str,
     map: &mut HashMap<Vec<u8>, Vec<u8>>,
     old: &[u8],
-    new: Vec<u8>,
-    path: &str,
+    new: &[u8],
 ) -> Result<()> {
     if let Some(prev) = map.get(old) {
-        if prev != &new {
+        if prev.as_slice() != new {
             crate::bail!(
                 "{}: conflicting mapping for line {:?}",
                 path,
@@ -188,24 +620,23 @@ fn insert_mapping(
             );
         }
     }
-    map.insert(old.to_vec(), new);
+    map.insert(old.to_vec(), new.to_vec());
     Ok(())
 }
 
-/// Reconcile a US PPU `.cpp` base against the EU patch: apply residual context-specific hunks at
-/// their unique exact match, then apply the global mechanical line replacements.
-pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
-    let hunks = parse_hunks(patch)?;
-    let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut residual: Vec<&HunkOwned> = Vec::new();
-
-    for h in &hunks {
+fn classify<'a>(
+    path: &str,
+    hunks: &'a [HunkOwned],
+    map: &mut HashMap<Vec<u8>, Vec<u8>>,
+    residual: &mut Vec<&'a HunkOwned>,
+) -> Result<()> {
+    for h in hunks {
         let mut fully = h.dels.len() == h.ins.len();
         if fully {
             for (old, new) in h.dels.iter().zip(h.ins.iter()) {
                 match mechanical(old, new) {
                     Some(Mech::Stvx16) | Some(Mech::Dcbz128) => {
-                        insert_mapping(&mut map, old, new.clone(), path)?;
+                        insert_mapping(path, map, old, new)?;
                     }
                     Some(Mech::Encoding) => {}
                     None => {
@@ -219,45 +650,34 @@ pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
             residual.push(h);
         }
     }
+    Ok(())
+}
+
+/// Reconcile a US PPU `.cpp` base against the EU patch.
+pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
+    let hunks = parse_hunks(patch)?;
+    let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut residual: Vec<&HunkOwned> = Vec::new();
+    classify(path, &hunks, &mut map, &mut residual)?;
 
     let mut lines = lines_owned(base);
+    let _ = check_mechanical_coverage(path, &map, &lines)?;
 
-    // Mechanical-map coverage: every distinct global mapping must apply to at least one US line,
-    // otherwise a mechanical transform is silently inapplicable (a genuine divergence or a bug).
-    {
-        let present: std::collections::HashSet<&[u8]> =
-            lines.iter().map(|l| l.as_slice()).collect();
-        for key in map.keys() {
-            if !present.contains(key.as_slice()) {
-                crate::bail!(
-                    "{}: mechanical mapping not present in the US file: {:?}",
-                    path,
-                    String::from_utf8_lossy(key)
-                );
-            }
-        }
+    let resolved = resolve_residual(path, &residual, &lines)?;
+    let mut rewrites: Vec<(usize, usize, Vec<Vec<u8>>)> = Vec::new();
+    for (ri, h) in residual.iter().enumerate() {
+        let r = resolved[ri].as_ref().ok_or_else(|| {
+            Error(format!("{}: residual hunk {} unresolved", path, ri + 1))
+        })?;
+        let win = &lines[r.us..r.us + h.old.len()];
+        let new_lines = rewrite_and_check(path, *h, win)?;
+        rewrites.push((r.us, h.old.len(), new_lines));
     }
-    for (idx, h) in residual.iter().enumerate() {
-        let count = count_matches(&lines, &h.old);
-        if count != 1 {
-            let first = h.old.first().cloned().unwrap_or_default();
-            crate::bail!(
-                "{}: residual hunk {} (old {} lines / new {} lines) has {} exact matches; \
-                 expected exactly 1. First old-side line: {:?}",
-                path,
-                idx + 1,
-                h.old.len(),
-                h.new.len(),
-                count,
-                String::from_utf8_lossy(&first)
-            );
-        }
-        let pos = find_match(&lines, &h.old).expect("count was 1");
-        let mut out = Vec::with_capacity(lines.len() - h.old.len() + h.new.len());
-        out.extend_from_slice(&lines[..pos]);
-        out.extend_from_slice(&h.new);
-        out.extend_from_slice(&lines[pos + h.old.len()..]);
-        lines = out;
+
+    // Apply rewrites bottom-up so earlier US positions are unaffected.
+    rewrites.sort_by(|a, b| b.0.cmp(&a.0));
+    for (us, old_len, new_lines) in rewrites {
+        lines.splice(us..us + old_len, new_lines).collect::<Vec<_>>();
     }
 
     for line in &mut lines {
@@ -274,8 +694,6 @@ pub fn reconcile_header(base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     diff::apply_patch(base, &normalized).map_err(|e| Error(e))
 }
 
-/// Reconcile one PPU file. `is_header` selects the CRLF-normalized strict-apply path for
-/// `ppu_recomp.h`; every `.cpp` file goes through the mechanical/residual reconciliation.
 pub fn reconcile(path: &str, base: &[u8], patch: &[u8], is_header: bool) -> Result<Vec<u8>> {
     if is_header {
         reconcile_header(base, patch)
@@ -301,59 +719,36 @@ mod tests {
 
     #[test]
     fn mechanical_store_is_exact() {
-        assert_eq!(
-            mechanical(store("0").as_bytes(), stvx16("0").as_bytes()),
-            Some(Mech::Stvx16)
-        );
-        assert_eq!(
-            mechanical(store("13").as_bytes(), stvx16("13").as_bytes()),
-            Some(Mech::Stvx16)
-        );
+        assert_eq!(mechanical(store("0").as_bytes(), stvx16("0").as_bytes()), Some(Mech::Stvx16));
+        assert_eq!(mechanical(store("13").as_bytes(), stvx16("13").as_bytes()), Some(Mech::Stvx16));
     }
 
     #[test]
     fn ambiguous_multi_store_line_is_not_mapped() {
-        let two = "{\
- memcpy(vm_base + (uint32_t)ea, &ctx->vr[0], 16); \
- memcpy(vm_base + (uint32_t)ea, &ctx->vr[1], 16); }\n";
-        let two_new = "{\
- ppu_stvx16((uint32_t)ea, &ctx->vr[0]); \
- ppu_stvx16((uint32_t)ea, &ctx->vr[1]); }\n";
+        let two = "{ memcpy(vm_base + (uint32_t)ea, &ctx->vr[0], 16); memcpy(vm_base + (uint32_t)ea, &ctx->vr[1], 16); }\n";
+        let two_new = "{ ppu_stvx16((uint32_t)ea, &ctx->vr[0]); ppu_stvx16((uint32_t)ea, &ctx->vr[1]); }\n";
         assert_eq!(mechanical(two.as_bytes(), two_new.as_bytes()), None);
     }
 
     #[test]
     fn encoding_noop_is_recognized() {
-        let old = "/* x \u{2014} y */\n";
-        let new = "/* x \u{fffd} y */\n";
         assert_eq!(
-            mechanical(old.as_bytes(), new.as_bytes()),
+            mechanical("/* x \u{2014} y */\n".as_bytes(), "/* x \u{fffd} y */\n".as_bytes()),
             Some(Mech::Encoding)
         );
     }
 
     #[test]
     fn cp1252_dash_is_a_comment_only_noop() {
-        let old = "/* trap \u{2014} ignored */\n";
-        let new = b"/* trap \x97 ignored */\n";
-        assert_eq!(mechanical(old.as_bytes(), new), Some(Mech::Encoding));
-        // An unrelated literal '~' must NOT be treated as a dash.
+        assert_eq!(mechanical("/* trap \u{2014} */\n".as_bytes(), b"/* trap \x97 */\n"), Some(Mech::Encoding));
         assert_eq!(mechanical(b"a ~ b\n", b"a \x97 b\n"), None);
-    }
-
-    #[test]
-    fn mechanical_mapping_not_in_us_base_is_rejected() {
-        // The patch maps a store line, but the US base does not contain it (register differs).
-        let (patch, _) = diff::make_patch(store("0").as_bytes(), stvx16("0").as_bytes(), "f", 1);
-        let err = reconcile_cpp("f", b"unrelated\n", &patch).unwrap_err();
-        assert!(err.to_string().contains("mechanical mapping not present"));
     }
 
     #[test]
     fn conflicting_mapping_is_rejected() {
         let mut map = HashMap::new();
-        insert_mapping(&mut map, b"old\n", b"new1\n".to_vec(), "f").unwrap();
-        let err = insert_mapping(&mut map, b"old\n", b"new2\n".to_vec(), "f").unwrap_err();
+        insert_mapping("f", &mut map, b"old\n", b"new1\n").unwrap();
+        let err = insert_mapping("f", &mut map, b"old\n", b"new2\n").unwrap_err();
         assert!(err.to_string().contains("conflicting"));
     }
 
@@ -362,8 +757,7 @@ mod tests {
         let base = b"A\nB\nC\nD\n";
         let fin = b"A\nX\nC\nD\n";
         let (patch, _) = diff::make_patch(base, fin, "f", 3);
-        let got = reconcile_cpp("f", base, &patch).unwrap();
-        assert_eq!(got, fin);
+        assert_eq!(reconcile_cpp("f", base, &patch).unwrap(), fin);
     }
 
     #[test]
@@ -372,7 +766,7 @@ mod tests {
         let fin = b"A\nX\nC\nA\nB\nC\n";
         let (patch, _) = diff::make_patch(base, fin, "f", 0);
         let err = reconcile_cpp("f", base, &patch).unwrap_err();
-        assert!(err.to_string().contains("exact matches"));
+        assert!(err.to_string().contains("ambiguous") || err.to_string().contains("candidate"));
     }
 
     #[test]
@@ -381,7 +775,117 @@ mod tests {
         let fin = b"#pragma once\n#include <stdint.h>\n#include <string.h>\n";
         let (patch, _) = diff::make_patch(base, fin, "h", 1);
         let crlf = replace_all(&patch, b"\n", b"\r\n");
-        let got = reconcile_header(base, &crlf).unwrap();
-        assert_eq!(got, fin);
+        assert_eq!(reconcile_header(base, &crlf).unwrap(), fin);
+    }
+
+    #[test]
+    fn mechanical_absent_is_not_applicable() {
+        // The complete EU old line is absent and no same-register raw store exists -> not a failure.
+        let (patch, _) = diff::make_patch(store("0").as_bytes(), stvx16("0").as_bytes(), "f", 1);
+        assert_eq!(reconcile_cpp("f", b"unrelated\n", &patch).unwrap(), b"unrelated\n");
+    }
+
+    #[test]
+    fn mechanical_partial_match_is_rejected() {
+        // Same register as the EU store but with a trailing difference -> partial match -> fail.
+        let key = store("0");
+        let partial = format!("{} \n", key.trim_end());
+        let (patch, _) = diff::make_patch(key.as_bytes(), stvx16("0").as_bytes(), "f", 1);
+        let err = reconcile_cpp("f", partial.as_bytes(), &patch).unwrap_err();
+        assert!(err.to_string().contains("plausible same-register"));
+    }
+
+    #[test]
+    fn token_tier_resolves_and_rewrites() {
+        let eu_old = b"if (x) goto func_00000010;\n";
+        let eu_new = b"if (x) goto func_00000010;  /* hook */\n";
+        let us = b"if (x) goto func_00000020;\n";
+        let (patch, _) = diff::make_patch(eu_old, eu_new, "f", 0);
+        let out = reconcile_cpp("f", us, &patch).unwrap();
+        assert_eq!(out, b"if (x) goto func_00000020;  /* hook */\n");
+    }
+
+    #[test]
+    fn hex_tier_resolves_and_rewrites() {
+        let eu_old = b"ctx->lr = 0x000000A0; func_00000010(ctx);\n";
+        let eu_new = b"ctx->lr = 0x000000A0; func_00000010(ctx); /* 0xA0 */\n";
+        let us = b"ctx->lr = 0x000000B0; func_00000020(ctx);\n";
+        let (patch, _) = diff::make_patch(eu_old, eu_new, "f", 0);
+        let out = reconcile_cpp("f", us, &patch).unwrap();
+        assert_eq!(out, b"ctx->lr = 0x000000B0; func_00000020(ctx); /* 0xB0 */\n");
+    }
+
+    #[test]
+    fn interpolation_disambiguates_by_order() {
+        let mut us = vec![b"ANCHOR_A\n".to_vec()];
+        for i in 0..10 {
+            us.push(format!("f{i}\n").into_bytes());
+        }
+        us.push(b"goto loc_AA000020;\n".to_vec());
+        for i in 10..19 {
+            us.push(format!("f{i}\n").into_bytes());
+        }
+        us.push(b"goto loc_BB000020;\n".to_vec());
+        for i in 20..29 {
+            us.push(format!("f{i}\n").into_bytes());
+        }
+        us.push(b"goto loc_CC000020;\n".to_vec());
+        for i in 30..40 {
+            us.push(format!("f{i}\n").into_bytes());
+        }
+        us.push(b"ANCHOR_B\n".to_vec());
+        let a = HunkOwned { os: 10, old: vec![b"ANCHOR_A\n".to_vec()], new: vec![b"ANCHOR_A\n".to_vec()], dels: vec![], ins: vec![] };
+        let mid = HunkOwned { os: 50, old: vec![b"goto loc_EE000010;\n".to_vec()], new: vec![b"X\n".to_vec()], dels: vec![b"goto loc_EE000010;\n".to_vec()], ins: vec![b"X\n".to_vec()] };
+        let b = HunkOwned { os: 90, old: vec![b"ANCHOR_B\n".to_vec()], new: vec![b"ANCHOR_B\n".to_vec()], dels: vec![], ins: vec![] };
+        let residual = vec![&a, &mid, &b];
+        let r = resolve_residual("f", &residual, &us).unwrap();
+        let chosen = r[1].as_ref().unwrap().us;
+        assert_eq!(&us[chosen], b"goto loc_BB000020;\n");
+    }
+
+    #[test]
+    fn new_side_token_uncovered_is_rejected() {
+        let eu_old = b"if (x) goto func_00000010;\n";
+        let eu_new = b"if (x) goto func_00000010; goto loc_DEADBEEF;\n";
+        let us = b"if (x) goto func_00000020;\n";
+        let (patch, _) = diff::make_patch(eu_old, eu_new, "f", 0);
+        let err = reconcile_cpp("f", us, &patch).unwrap_err();
+        assert!(err.to_string().contains("not covered"));
+    }
+
+    #[test]
+    fn curated_alias_rewrites_movie_pool_label() {
+        // Byte-exact-context insertion whose new side introduces the EU movie-pool label.
+        let base = b"A\nB\nC\n";
+        let fin = b"A\nB\nif (wait) goto loc_001850EC;\nC\n";
+        let (patch, _) = diff::make_patch(base, fin, "f", 1);
+        let out = reconcile_cpp("f", base, &patch).unwrap();
+        assert_eq!(out, b"A\nB\nif (wait) goto loc_001855EC;\nC\n");
+    }
+
+    #[test]
+    #[ignore]
+    fn real_data_reconcile_smoke() {
+        // cargo test runs with CWD = the installer crate dir, so the repo root is `..`.
+        let root = std::path::Path::new("../.installer/us/fresh/infamous-recomp/recompiled");
+        let pdir = std::path::Path::new("patches/infamous-recomp/recompiled");
+        if !root.exists() {
+            return;
+        }
+        for name in [
+            "ppu_recomp.h",
+            "ppu_recomp_000.cpp",
+            "ppu_recomp_001.cpp",
+            "ppu_recomp_002.cpp",
+            "ppu_recomp_003.cpp",
+            "ppu_recomp_004.cpp",
+        ] {
+            let base = std::fs::read(root.join(name)).unwrap();
+            let patch = std::fs::read(pdir.join(format!("{name}.patch"))).unwrap();
+            let fin = reconcile(name, &base, &patch, name == "ppu_recomp.h")
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!fin.windows(3).any(|w| w == b"\xef\xbf\xbd"));
+            eprintln!("{name}: reconciled {} -> {} bytes", base.len(), fin.len());
+        }
     }
 }

@@ -303,6 +303,7 @@ pub fn apply_lock(
     installer_dir: &Path,
     lock: &Lock,
     tolerate: &[String],
+    patch_overrides: &std::collections::HashMap<String, Vec<u8>>,
 ) -> Result<()> {
     let present: BTreeSet<String> =
         util::select_files(root, &m.gen_include, &m.gen_exclude, SKIP_DIRS)?
@@ -348,7 +349,11 @@ pub fn apply_lock(
                     Vec::new()
                 };
                 let pp = patch_path(installer_dir, &e.path);
-                let patch = fs::read(&pp).ctx(|| format!("reading {}", pp.display()))?;
+                let patch = if let Some(p) = patch_overrides.get(&e.path) {
+                    p.clone()
+                } else {
+                    fs::read(&pp).ctx(|| format!("reading {}", pp.display()))?
+                };
                 let new = diff::apply_patch(&old, &patch)
                     .map_err(|x| util::Error(format!("{}: {x}", pp.display())))?;
                 if hash::sha256_hex(&new) != *fin {
