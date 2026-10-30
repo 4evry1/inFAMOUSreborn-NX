@@ -1,5 +1,5 @@
---- a/infamous-recomp/spu/spu_0002_at_0068FE00/spu_recomp.c
-+++ b/infamous-recomp/spu/spu_0002_at_0068FE00/spu_recomp.c
+--- a/infamous-recomp/spu/spu_0002_at_0068F900/spu_recomp.c
++++ b/infamous-recomp/spu/spu_0002_at_0068F900/spu_recomp.c
 @@ -110,7 +110,7 @@
  loc_00004188:
          ctx->gpr[80] = spu_ai(ctx->gpr[80], -4);
@@ -10,7 +10,7 @@
          ctx->gpr[3] = spu_rotqby(ctx->gpr[7], ctx->gpr[80]);
          ctx->gpr[2] = spu_ceqi(ctx->gpr[3], -1);
 @@ -121,7 +121,7 @@
- void spu_0002_at_0068FE00_spu_func_000041A8(spu_context* ctx) {
+ void spu_0002_at_0068F900_spu_func_000041A8(spu_context* ctx) {
  loc_000041A8:
          ctx->gpr[3] = spu_a(ctx->gpr[3], ctx->gpr[126]);
 -        { uint32_t _bt = ctx->gpr[3]._u32[0]; ctx->gpr[0] = spu_link(0x41B0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x41B0); ctx->host_depth--; spu_img_restore(ctx, _si); } }
@@ -24,7 +24,7 @@
          ctx->gpr[14] = spu_rotqbyi(ctx->gpr[86], 12);
 -        { uint32_t _bt = ctx->gpr[85]._u32[0]; ctx->gpr[0] = spu_link(0x82B4); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x82B4); ctx->host_depth--; spu_img_restore(ctx, _si); } }
 +        ctx->gpr[0] = spu_link(0x82B4); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = ctx->gpr[85]._u32[0]; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x82B4); ctx->host_depth--; spu_img_restore(ctx, _si); }
-         { ctx->pc = 0x82B4; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_000082B4); }
+         { ctx->pc = 0x82B4; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_000082B4); }
  }
  
 @@ -14209,7 +14209,7 @@
@@ -106,7 +106,7 @@
 -        { uint32_t _bt = ctx->gpr[12]._u32[0]; ctx->gpr[0] = spu_link(0x11930); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x11930); ctx->host_depth--; spu_img_restore(ctx, _si); } }
 +        ctx->gpr[0] = spu_link(0x11930); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = ctx->gpr[12]._u32[0]; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x11930); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[3] = spu_ori(ctx->gpr[105], 0);
-         ctx->gpr[0] = spu_link(0x11938); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0002_at_0068FE00_spu_func_0000F410(ctx); spu_drain_call(ctx, 0x11938); ctx->host_depth--; spu_img_restore(ctx, _si); }
+         ctx->gpr[0] = spu_link(0x11938); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0002_at_0068F900_spu_func_0000F410(ctx); spu_drain_call(ctx, 0x11938); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[80] = spu_ls_read128(ctx, ctx->gpr[87]._u32[0] + 0x230);
 @@ -15273,7 +15273,7 @@
          ctx->gpr[5] = spu_ila(0x17640);
@@ -114,7 +114,7 @@
          ctx->gpr[99] = spu_rotqby(ctx->gpr[94], ctx->gpr[81]);
 -        { uint32_t _bt = ctx->gpr[99]._u32[0]; ctx->gpr[0] = spu_link(0x11B30); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x11B30); ctx->host_depth--; spu_img_restore(ctx, _si); } }
 +        ctx->gpr[0] = spu_link(0x11B30); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = ctx->gpr[99]._u32[0]; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x11B30); ctx->host_depth--; spu_img_restore(ctx, _si); }
-         ctx->gpr[0] = spu_link(0x11B34); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0002_at_0068FE00_spu_func_0000FA38(ctx); spu_drain_call(ctx, 0x11B34); ctx->host_depth--; spu_img_restore(ctx, _si); }
+         ctx->gpr[0] = spu_link(0x11B34); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0002_at_0068F900_spu_func_0000FA38(ctx); spu_drain_call(ctx, 0x11B34); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[4] = spu_ila(0x15310);
          ctx->gpr[3] = spu_andi(ctx->gpr[3], 255);
 @@ -15430,7 +15430,7 @@
@@ -142,7 +142,7 @@
 -        ctx->gpr[32] = spu_xorbi(ctx->gpr[36], 317);
 +        /* TODO spu: .word 0x464F5220 */ spu_unsupported(0x14334, ".word");
          ctx->gpr[79] = spu_cgthi(ctx->gpr[28], 317);
-         if (ctx->gpr[84]._u32[0] == 0) { ctx->pc = 0x3BDE4; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_0003BDE4); }
+         if (ctx->gpr[84]._u32[0] == 0) { ctx->pc = 0x3BDE4; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_0003BDE4); }
          /* TODO spu: .word 0x50555421 */ spu_unsupported(0x14340, ".word");
 @@ -18860,7 +18860,7 @@
          ctx->gpr[110] = spu_mpyi(ctx->gpr[114], 461);
@@ -154,7 +154,7 @@
          ctx->gpr[105] = spu_mpyui(ctx->gpr[104], 433);
          /* TODO spu: .word 0x3A3A6B4E */ spu_unsupported(0x1479C, ".word");
 @@ -18902,7 +18902,7 @@
- void spu_0002_at_0068FE00_spu_func_00014958(spu_context* ctx) {
+ void spu_0002_at_0068F900_spu_func_00014958(spu_context* ctx) {
          ctx->gpr[64] = spu_ori(ctx->gpr[80], 5);
          ctx->gpr[64] = spu_orhi(ctx->gpr[80], 5);
 -        ctx->gpr[64] = spu_orbi(ctx->gpr[80], 5);
@@ -163,7 +163,7 @@
          ctx->gpr[64] = spu_sf(ctx->gpr[80], ctx->gpr[5]);
          ctx->gpr[86] = spu_sfh(ctx->gpr[41], ctx->gpr[4]);
 @@ -18932,7 +18932,7 @@
- void spu_0002_at_0068FE00_spu_func_00014BE8(spu_context* ctx) {
+ void spu_0002_at_0068F900_spu_func_00014BE8(spu_context* ctx) {
          ctx->gpr[64] = spu_ori(ctx->gpr[80], 5);
          ctx->gpr[64] = spu_orhi(ctx->gpr[80], 5);
 -        ctx->gpr[64] = spu_orbi(ctx->gpr[80], 5);
@@ -172,12 +172,12 @@
          ctx->gpr[64] = spu_sf(ctx->gpr[80], ctx->gpr[5]);
          ctx->gpr[86] = spu_sfh(ctx->gpr[41], ctx->gpr[4]);
 @@ -19228,7 +19228,7 @@
-         if (ctx->gpr[85]._u32[0] == 0) { ctx->pc = 0x3EB54; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_0003EB54); }
-         if (ctx->gpr[66]._u32[0] == 0) { ctx->pc = 0x36368; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_00036368); }
+         if (ctx->gpr[85]._u32[0] == 0) { ctx->pc = 0x3EB54; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_0003EB54); }
+         if (ctx->gpr[66]._u32[0] == 0) { ctx->pc = 0x36368; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_00036368); }
          if (ctx->gpr[38]._u32[0] > (uint32_t)(261)) { extern void spu_halt(spu_context*); fprintf(stderr, "[spu] HALT-ASSERT hlgti pc=0x150DC img=%d\n", ctx->image_id); ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }
 -        ctx->gpr[33] = spu_xorhi(ctx->gpr[40], 329);
 +        /* TODO spu: .word 0x45525421 */ spu_unsupported(0x150E0, ".word");
-         if (ctx->gpr[42]._u32[0] == 0) { ctx->pc = 0x2A234; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_0002A234); }
+         if (ctx->gpr[42]._u32[0] == 0) { ctx->pc = 0x2A234; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_0002A234); }
          /* TODO spu: .word 0x0A25730A */ spu_unsupported(0x150E8, ".word");
          /* TODO spu: .word 0x696E2066 */ spu_unsupported(0x150EC, ".word");
 @@ -19308,7 +19308,7 @@
@@ -187,7 +187,7 @@
 -        ctx->gpr[32] = spu_xorhi(ctx->gpr[38], 329);
 +        /* TODO spu: .word 0x45525320 */ spu_unsupported(0x151FC, ".word");
          ctx->gpr[65] = spu_xori(ctx->gpr[40], 261);
-         if (ctx->gpr[34]._u32[0] != 0) { ctx->pc = 0x25B0C; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_00025B0C); }
+         if (ctx->gpr[34]._u32[0] != 0) { ctx->pc = 0x25B0C; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_00025B0C); }
          ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 @@ -19355,10 +19355,10 @@
          /* TODO spu: .word 0x28293A20 */ spu_unsupported(0x152A0, ".word");
@@ -196,9 +196,9 @@
 -        ctx->gpr[84] = spu_xorhi(ctx->gpr[38], 129);
 +        /* TODO spu: .word 0x45205354 */ spu_unsupported(0x152AC, ".word");
          ctx->gpr[83] = spu_ilhu(0xA88A);
-         if (ctx->gpr[90]._u32[0] == 0) { ctx->pc = 0x3ECFC; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_0003ECFC); }
+         if (ctx->gpr[90]._u32[0] == 0) { ctx->pc = 0x3ECFC; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_0003ECFC); }
 -        ctx->gpr[110] = spu_xorhi(ctx->gpr[56], 133);
 +        /* TODO spu: .word 0x45215C6E */ spu_unsupported(0x152B8, ".word");
-         { ctx->pc = 0x152BC; SPU_XFER(ctx, spu_0002_at_0068FE00_spu_func_000152BC); }
+         { ctx->pc = 0x152BC; SPU_XFER(ctx, spu_0002_at_0068F900_spu_func_000152BC); }
  }
  

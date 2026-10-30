@@ -5,6 +5,7 @@ use crate::hash;
 use crate::lock::{Entry, Lock};
 use crate::manifest::Manifest;
 use crate::pipeline::SKIP_DIRS;
+use crate::spu_alias::Aliases;
 use crate::util::{self, Ctx, Error, Result};
 use std::collections::BTreeSet;
 use std::fs;
@@ -25,6 +26,7 @@ pub fn rebase_lock(
     installer_dir: &Path,
     source: &Lock,
     eboot_sha: &str,
+    aliases: &Aliases,
 ) -> Result<RebaseReport> {
     let known: BTreeSet<&str> = source
         .files
@@ -40,7 +42,10 @@ pub fn rebase_lock(
     let unexpected: Vec<&str> = present
         .iter()
         .map(String::as_str)
-        .filter(|path| !known.contains(path) && !manifest.is_loose(path))
+        .filter(|path| {
+            let eu = aliases.reverse_path(path);
+            !known.contains(eu.as_str()) && !manifest.is_loose(path)
+        })
         .collect();
     if !unexpected.is_empty() {
         crate::bail!(
@@ -56,8 +61,9 @@ pub fn rebase_lock(
     let (mut unchanged, mut patched, mut created, mut removed) = (0, 0, 0, 0);
 
     for source_entry in &source.files {
-        let fresh_path = util::join_slash(fresh, &source_entry.path);
-        let patch_path = patched_path(installer_dir, &source_entry.path);
+        let us_path = aliases.remap_path(&source_entry.path);
+        let fresh_path = util::join_slash(fresh, &us_path);
+        let patch_path = patched_path(installer_dir, &us_path);
 
         if source_entry.fin.is_none() {
             let base = if fresh_path.is_file() {
@@ -72,7 +78,7 @@ pub fn rebase_lock(
                 None
             };
             lock.files.push(Entry {
-                path: source_entry.path.clone(),
+                path: us_path.clone(),
                 base,
                 fin: None,
             });
@@ -90,7 +96,7 @@ pub fn rebase_lock(
             })?;
             let digest = hash::sha256_hex(&bytes);
             lock.files.push(Entry {
-                path: source_entry.path.clone(),
+                path: us_path.clone(),
                 base: Some(digest.clone()),
                 fin: Some(digest),
             });
@@ -129,7 +135,7 @@ pub fn rebase_lock(
             .map_err(|error| Error(format!("{}: {error}", source_entry.path)))?;
         let fin = Some(hash::sha256_hex(&new));
         lock.files.push(Entry {
-            path: source_entry.path.clone(),
+            path: us_path.clone(),
             base,
             fin,
         });
@@ -327,6 +333,7 @@ name = "inFamous"
             &fixture.installer,
             &source,
             &hash("us-eboot\n"),
+            &Aliases::default(),
         )
         .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -345,6 +352,7 @@ name = "inFamous"
             &fixture.installer,
             &source,
             &hash("us-eboot\n"),
+            &Aliases::default(),
         ) {
             Ok(_) => panic!("rebase unexpectedly returned a lock"),
             Err(error) => error.to_string(),
@@ -367,6 +375,7 @@ name = "inFamous"
             &fixture.installer,
             &source,
             &hash("us-eboot\n"),
+            &Aliases::default(),
         ) {
             Ok(_) => panic!("rebase unexpectedly returned a lock"),
             Err(error) => error.to_string(),

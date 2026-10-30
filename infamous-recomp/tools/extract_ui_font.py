@@ -17,7 +17,7 @@ import os, sys, struct, numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from psarc import Psarc
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
-ARC = os.path.join(ROOT, '..', 'Infamous (Europe) (Fr,De,Es,It,Nl)', 'PS3_GAME', 'USRDIR', 'cache', 'psarc', 'install1', 'infamous1.psarc_s')
+ARC = os.path.join(ROOT, '..', 'Infamous (USA) (En,Fr,Es) (v02.00)', 'PS3_GAME', 'USRDIR', 'cache', 'psarc', 'install1', 'infamous1.psarc_s')
 lang = sys.argv[1] if len(sys.argv) > 1 else 'english'
 p = Psarc(ARC); d = p.read(p.names.index('/lang_%s.xpp' % lang))
 assert d[:4] == b'PACK'

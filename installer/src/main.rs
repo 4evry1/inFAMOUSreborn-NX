@@ -9,7 +9,8 @@
 //!   infamous-installer export --out <dir>    (maintainer) copy the publishable source tree
 
 use infamous_installer::{
-    bail, game, hash, iso, lock, manifest, payload, pipeline, rebase, toolchain, update, util,
+    bail, game, hash, iso, lock, manifest, payload, pipeline, rebase, spu_alias, toolchain, update,
+    util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -1121,6 +1122,14 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         util::warn(&format!("optional steps failed: {}", failed.join(", ")));
     }
 
+    util::heading("Locating the US SPU group renames");
+    let aliases = spu_alias::derive(&source, &fresh)?;
+    if !aliases.is_empty() {
+        util::info(&format!("groups: {}", aliases.describe()));
+        util::heading("Relocating SPU group names in the patch set");
+        spu_alias::transform_patches(&s.installer_dir, &aliases)?;
+    }
+
     util::heading("Rebasing the patch set onto the US tree");
     let rebase::RebaseReport {
         lock: candidate,
@@ -1128,7 +1137,7 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         patched,
         created,
         removed,
-    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha)?;
+    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha, &aliases)?;
     util::info(&format!(
         "{unchanged} unchanged, {patched} patched, {created} created, {removed} removed"
     ));

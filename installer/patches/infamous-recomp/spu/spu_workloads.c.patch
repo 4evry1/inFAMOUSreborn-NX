@@ -1,7 +1,7 @@
 --- a/infamous-recomp/spu/spu_workloads.c
 +++ b/infamous-recomp/spu/spu_workloads.c
 @@ -61,3 +61,9 @@
-     spu_workload_register_img(0xED2F48B7B9801EE9ULL, spu_0007_at_00700600_spu_func_00004080, 9, "spu_0007_at_00700600.text");
+     spu_workload_register_img(0xED2F48B7B9801EE9ULL, spu_0007_at_00700100_spu_func_00004080, 9, "spu_0007_at_00700100.text");
      spu_begin_image(0);
  }
 +

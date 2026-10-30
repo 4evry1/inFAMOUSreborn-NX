@@ -1,5 +1,5 @@
---- a/infamous-recomp/spu/spu_0004_at_006BF480/spu_recomp.c
-+++ b/infamous-recomp/spu/spu_0004_at_006BF480/spu_recomp.c
+--- a/infamous-recomp/spu/spu_0004_at_006BEF80/spu_recomp.c
++++ b/infamous-recomp/spu/spu_0004_at_006BEF80/spu_recomp.c
 @@ -166,7 +166,7 @@
  loc_00004188:
          ctx->gpr[80] = spu_ai(ctx->gpr[80], -4);
@@ -10,7 +10,7 @@
          ctx->gpr[3] = spu_rotqby(ctx->gpr[7], ctx->gpr[80]);
          ctx->gpr[2] = spu_ceqi(ctx->gpr[3], -1);
 @@ -177,7 +177,7 @@
- void spu_0004_at_006BF480_spu_func_000041A8(spu_context* ctx) {
+ void spu_0004_at_006BEF80_spu_func_000041A8(spu_context* ctx) {
  loc_000041A8:
          ctx->gpr[3] = spu_a(ctx->gpr[3], ctx->gpr[126]);
 -        { uint32_t _bt = ctx->gpr[3]._u32[0]; ctx->gpr[0] = spu_link(0x41B0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x41B0); ctx->host_depth--; spu_img_restore(ctx, _si); } }
@@ -97,7 +97,7 @@
 -        { uint32_t _bt = ctx->gpr[12]._u32[0]; ctx->gpr[0] = spu_link(0x12FE0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x12FE0); ctx->host_depth--; spu_img_restore(ctx, _si); } }
 +        ctx->gpr[0] = spu_link(0x12FE0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = ctx->gpr[12]._u32[0]; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x12FE0); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[3] = spu_ori(ctx->gpr[105], 0);
-         ctx->gpr[0] = spu_link(0x12FE8); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0004_at_006BF480_spu_func_00010AC0(ctx); spu_drain_call(ctx, 0x12FE8); ctx->host_depth--; spu_img_restore(ctx, _si); }
+         ctx->gpr[0] = spu_link(0x12FE8); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0004_at_006BEF80_spu_func_00010AC0(ctx); spu_drain_call(ctx, 0x12FE8); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[80] = spu_ls_read128(ctx, ctx->gpr[87]._u32[0] + 0x230);
 @@ -17599,7 +17599,7 @@
          ctx->gpr[5] = spu_ila(0x1C400);
@@ -105,7 +105,7 @@
          ctx->gpr[99] = spu_rotqby(ctx->gpr[94], ctx->gpr[81]);
 -        { uint32_t _bt = ctx->gpr[99]._u32[0]; ctx->gpr[0] = spu_link(0x131E0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = _bt; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x131E0); ctx->host_depth--; spu_img_restore(ctx, _si); } }
 +        ctx->gpr[0] = spu_link(0x131E0); { int32_t _si = (int32_t)ctx->image_id; ctx->pc = ctx->gpr[99]._u32[0]; ctx->host_depth++; spu_indirect_branch(ctx); spu_drain_call(ctx, 0x131E0); ctx->host_depth--; spu_img_restore(ctx, _si); }
-         ctx->gpr[0] = spu_link(0x131E4); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0004_at_006BF480_spu_func_000110E8(ctx); spu_drain_call(ctx, 0x131E4); ctx->host_depth--; spu_img_restore(ctx, _si); }
+         ctx->gpr[0] = spu_link(0x131E4); { int32_t _si = (int32_t)ctx->image_id; ctx->host_depth++; spu_0004_at_006BEF80_spu_func_000110E8(ctx); spu_drain_call(ctx, 0x131E4); ctx->host_depth--; spu_img_restore(ctx, _si); }
          ctx->gpr[4] = spu_ila(0x1A3E0);
          ctx->gpr[3] = spu_andi(ctx->gpr[3], 255);
 @@ -17756,7 +17756,7 @@
@@ -168,7 +168,7 @@
          ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 @@ -20815,7 +20815,7 @@
  
- void spu_0004_at_006BF480_spu_func_00018FE0(spu_context* ctx) {
+ void spu_0004_at_006BEF80_spu_func_00018FE0(spu_context* ctx) {
          ctx->gpr[5] = spu_ori(ctx->gpr[10], 20);
 -        ctx->gpr[7] = spu_orbi(ctx->gpr[12], 24);
 +        /* TODO spu: .word 0x06060607 */ spu_unsupported(0x18FE4, ".word");
@@ -315,7 +315,7 @@
 @@ -21122,11 +21122,11 @@
  }
  
- void spu_0004_at_006BF480_spu_func_00019A60(spu_context* ctx) {
+ void spu_0004_at_006BEF80_spu_func_00019A60(spu_context* ctx) {
 -        ctx->gpr[5] = spu_orbi(ctx->gpr[10], 20);
 -        ctx->gpr[3] = spu_orbi(ctx->gpr[14], 20);
 +        /* TODO spu: .word 0x06050505 */ spu_unsupported(0x19A60, ".word");
@@ -346,12 +346,12 @@
  }
  
 @@ -21450,7 +21450,7 @@
-         if (ctx->gpr[85]._u32[0] == 0) { ctx->pc = 0x3C24; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_00003C24); }
-         if (ctx->gpr[66]._u32[0] == 0) { ctx->pc = 0x3B438; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_0003B438); }
+         if (ctx->gpr[85]._u32[0] == 0) { ctx->pc = 0x3C24; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_00003C24); }
+         if (ctx->gpr[66]._u32[0] == 0) { ctx->pc = 0x3B438; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_0003B438); }
          if (ctx->gpr[38]._u32[0] > (uint32_t)(261)) { extern void spu_halt(spu_context*); fprintf(stderr, "[spu] HALT-ASSERT hlgti pc=0x1A1AC img=%d\n", ctx->image_id); ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }
 -        ctx->gpr[33] = spu_xorhi(ctx->gpr[40], 329);
 +        /* TODO spu: .word 0x45525421 */ spu_unsupported(0x1A1B0, ".word");
-         if (ctx->gpr[42]._u32[0] == 0) { ctx->pc = 0x2F304; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_0002F304); }
+         if (ctx->gpr[42]._u32[0] == 0) { ctx->pc = 0x2F304; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_0002F304); }
          /* TODO spu: .word 0x0A25730A */ spu_unsupported(0x1A1B8, ".word");
          /* TODO spu: .word 0x696E2066 */ spu_unsupported(0x1A1BC, ".word");
 @@ -21530,7 +21530,7 @@
@@ -361,7 +361,7 @@
 -        ctx->gpr[32] = spu_xorhi(ctx->gpr[38], 329);
 +        /* TODO spu: .word 0x45525320 */ spu_unsupported(0x1A2CC, ".word");
          ctx->gpr[65] = spu_xori(ctx->gpr[40], 261);
-         if (ctx->gpr[34]._u32[0] != 0) { ctx->pc = 0x2ABDC; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_0002ABDC); }
+         if (ctx->gpr[34]._u32[0] != 0) { ctx->pc = 0x2ABDC; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_0002ABDC); }
          ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 @@ -21577,10 +21577,10 @@
          /* TODO spu: .word 0x28293A20 */ spu_unsupported(0x1A370, ".word");
@@ -370,9 +370,9 @@
 -        ctx->gpr[84] = spu_xorhi(ctx->gpr[38], 129);
 +        /* TODO spu: .word 0x45205354 */ spu_unsupported(0x1A37C, ".word");
          ctx->gpr[83] = spu_ilhu(0xA88A);
-         if (ctx->gpr[90]._u32[0] == 0) { ctx->pc = 0x3DCC; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_00003DCC); }
+         if (ctx->gpr[90]._u32[0] == 0) { ctx->pc = 0x3DCC; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_00003DCC); }
 -        ctx->gpr[110] = spu_xorhi(ctx->gpr[56], 133);
 +        /* TODO spu: .word 0x45215C6E */ spu_unsupported(0x1A388, ".word");
-         { ctx->pc = 0x1A38C; SPU_XFER(ctx, spu_0004_at_006BF480_spu_func_0001A38C); }
+         { ctx->pc = 0x1A38C; SPU_XFER(ctx, spu_0004_at_006BEF80_spu_func_0001A38C); }
  }
  
