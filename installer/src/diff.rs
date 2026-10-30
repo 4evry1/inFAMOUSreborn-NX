@@ -377,10 +377,10 @@ fn make_patch_raw(old: &[u8], new: &[u8], name: &str, ctx: usize) -> (Vec<u8>, P
     (out, stats)
 }
 
-struct Hunk<'a> {
-    old_start: usize,
-    old_count: usize,
-    lines: Vec<(u8, &'a [u8])>,
+pub(crate) struct Hunk<'a> {
+    pub(crate) old_start: usize,
+    pub(crate) old_count: usize,
+    pub(crate) lines: Vec<(u8, &'a [u8])>,
 }
 
 fn parse_range(s: &str) -> Option<(usize, usize)> {
@@ -391,7 +391,7 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
-fn parse_patch(patch: &[u8]) -> Result<Vec<Hunk<'_>>, String> {
+pub(crate) fn parse_patch(patch: &[u8]) -> Result<Vec<Hunk<'_>>, String> {
     let raw = split_lines(patch);
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut k = 0;

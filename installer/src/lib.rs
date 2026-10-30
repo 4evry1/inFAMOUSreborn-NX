@@ -8,6 +8,7 @@ pub mod lock;
 pub mod manifest;
 pub mod payload;
 pub mod pipeline;
+pub mod ppu_compat;
 pub mod rebase;
 pub mod setup;
 pub mod spu_alias;

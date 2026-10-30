@@ -9,8 +9,8 @@
 //!   infamous-installer export --out <dir>    (maintainer) copy the publishable source tree
 
 use infamous_installer::{
-    bail, game, hash, iso, lock, manifest, payload, pipeline, rebase, spu_alias, toolchain, update,
-    util,
+    bail, diff, game, hash, iso, lock, manifest, payload, pipeline, ppu_compat, rebase, spu_alias,
+    toolchain, update, util,
 };
 use manifest::Manifest;
 use pipeline::Vars;
@@ -1128,6 +1128,31 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         util::info(&format!("groups: {}", aliases.describe()));
         util::heading("Relocating SPU group names in the patch set");
         spu_alias::transform_patches(&s.installer_dir, &aliases)?;
+    }
+
+    util::heading("Reconciling the PPU hand-edits onto the US lift");
+    let ppu_files = [
+        "ppu_recomp.h",
+        "ppu_recomp_000.cpp",
+        "ppu_recomp_001.cpp",
+        "ppu_recomp_002.cpp",
+        "ppu_recomp_003.cpp",
+        "ppu_recomp_004.cpp",
+    ];
+    let mut ppu_patches: Vec<(String, Vec<u8>)> = Vec::new();
+    for name in ppu_files {
+        let rel = format!("infamous-recomp/recompiled/{name}");
+        let base_path = util::join_slash(&fresh, &rel);
+        let patch_path = util::join_slash(&s.installer_dir, &format!("patches/{rel}.patch"));
+        let base = std::fs::read(&base_path).ctx(|| format!("reading {}", base_path.display()))?;
+        let patch = std::fs::read(&patch_path).ctx(|| format!("reading {}", patch_path.display()))?;
+        let fin = ppu_compat::reconcile(&rel, &base, &patch, name == "ppu_recomp.h")?;
+        let (us_patch, _) = diff::make_patch(&base, &fin, &rel, 3);
+        ppu_patches.push((rel, us_patch));
+    }
+    for (rel, us_patch) in &ppu_patches {
+        let patch_path = util::join_slash(&s.installer_dir, &format!("patches/{rel}.patch"));
+        util::write_file(&patch_path, us_patch)?;
     }
 
     util::heading("Rebasing the patch set onto the US tree");
