@@ -432,8 +432,12 @@ mod tests {
         let eu_fin = "void spu_0000_at_005F6500_spu_func_0() { new; }\n";
         let us_base = "void spu_0000_at_005F6000_spu_func_0() { old; }\n";
         let us_fin = "void spu_0000_at_005F6000_spu_func_0() { new; }\n";
-        let (patch, _) =
-            diff::make_patch(eu_base.as_bytes(), eu_fin.as_bytes(), "spu_0000_at_005F6500/x.c", 3);
+        let (patch, _) = diff::make_patch(
+            eu_base.as_bytes(),
+            eu_fin.as_bytes(),
+            "spu_0000_at_005F6500/x.c",
+            3,
+        );
         // The un-remapped patch must not apply to the US base.
         assert!(diff::apply_patch(us_base.as_bytes(), &patch).is_err());
         let remapped = aliases.remap_bytes(&patch);

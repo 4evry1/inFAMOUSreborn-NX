@@ -1092,6 +1092,9 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
     let elf = s.eboot(&g, Some(&py))?;
     let sha = hash::sha256_file(&elf)?;
     util::info(&format!("EBOOT.elf sha256 {sha}"));
+    // Ignore the EU source-lock hash: validate only the manifest's exact US pin before promotion.
+    // No --force override here; a mismatched EBOOT must never be rebased.
+    check_eboot_sha(&s.m.eboot_sha256, None, &sha, false)?;
 
     util::heading("Loading the current patch set");
     let source = lock::Lock::load(&s.installer_dir.join("generated.lock"))?
@@ -1153,7 +1156,8 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         let base_path = util::join_slash(&fresh, &rel);
         let patch_path = util::join_slash(&s.installer_dir, &format!("patches/{rel}.patch"));
         let base = std::fs::read(&base_path).ctx(|| format!("reading {}", base_path.display()))?;
-        let patch = std::fs::read(&patch_path).ctx(|| format!("reading {}", patch_path.display()))?;
+        let patch =
+            std::fs::read(&patch_path).ctx(|| format!("reading {}", patch_path.display()))?;
         let fin = ppu_compat::reconcile(&rel, &base, &patch, name == "ppu_recomp.h")?;
         let (us_patch, _) = diff::make_patch(&base, &fin, &rel, 3);
         ppu_overrides.insert(rel, us_patch);
@@ -1166,7 +1170,15 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
         patched,
         created,
         removed,
-    } = rebase::rebase_lock(&s.m, &fresh, &s.installer_dir, &source, &sha, &aliases, &ppu_overrides)?;
+    } = rebase::rebase_lock(
+        &s.m,
+        &fresh,
+        &s.installer_dir,
+        &source,
+        &sha,
+        &aliases,
+        &ppu_overrides,
+    )?;
     util::info(&format!(
         "{unchanged} unchanged, {patched} patched, {created} created, {removed} removed"
     ));
@@ -1175,7 +1187,14 @@ fn cmd_rebase_patches(s: &Session) -> Result<()> {
     candidate.save(&candidate_path)?;
 
     util::heading("Applying the candidate lock and verifying it");
-    pipeline::apply_lock(&s.m, &fresh, &s.installer_dir, &candidate, &[], &ppu_overrides)?;
+    pipeline::apply_lock(
+        &s.m,
+        &fresh,
+        &s.installer_dir,
+        &candidate,
+        &[],
+        &ppu_overrides,
+    )?;
     if !pipeline::lock_satisfied(&fresh, &candidate)? {
         bail!("the candidate lock did not reproduce every generated file");
     }
@@ -1338,6 +1357,37 @@ mod tests {
             EbootDecision::Accepted
         );
         assert!(check_eboot_sha(&m, None, other, false).is_err());
+    }
+
+    #[test]
+    fn rebase_eboot_pin_accepts_the_manifest_pin_without_lock() {
+        // rebase-patches validates only the manifest pin (the EU source lock's eboot is ignored).
+        let m =
+            vec!["4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4".to_string()];
+        assert_eq!(
+            check_eboot_sha(
+                &m,
+                None,
+                "4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4",
+                false,
+            )
+            .unwrap(),
+            EbootDecision::Accepted
+        );
+    }
+
+    #[test]
+    fn rebase_eboot_pin_rejects_a_non_manifest_hash() {
+        // The EU EBOOT hash is rejected by the US manifest pin, with no --force override.
+        let m =
+            vec!["4f2db3fb7c76fbb4f80cbc8445cf0ea1570a664996a7787e690efcc1a39befb4".to_string()];
+        assert!(check_eboot_sha(
+            &m,
+            None,
+            "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd",
+            false,
+        )
+        .is_err());
     }
 
     #[test]

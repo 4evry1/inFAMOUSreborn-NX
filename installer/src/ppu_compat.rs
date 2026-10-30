@@ -331,21 +331,30 @@ fn resolve_residual(
         let h = *h;
         let m1 = find_seq(us_lines, &h.old);
         if m1.len() == 1 {
-            resolved[ri] = Some(Resolved { us: m1[0], _tier: Tier::Exact });
+            resolved[ri] = Some(Resolved {
+                us: m1[0],
+                _tier: Tier::Exact,
+            });
             anchors.push((h.os, m1[0]));
             continue;
         }
         let old2: Vec<Vec<u8>> = h.old.iter().map(|l| norm_tokens(l)).collect();
         let m2 = find_seq(&us2, &old2);
         if m2.len() == 1 {
-            resolved[ri] = Some(Resolved { us: m2[0], _tier: Tier::Tokens });
+            resolved[ri] = Some(Resolved {
+                us: m2[0],
+                _tier: Tier::Tokens,
+            });
             anchors.push((h.os, m2[0]));
             continue;
         }
         let old3: Vec<Vec<u8>> = old2.iter().map(|l| norm_hex(l)).collect();
         let m3 = find_seq(&us3, &old3);
         if m3.len() == 1 {
-            resolved[ri] = Some(Resolved { us: m3[0], _tier: Tier::Hex });
+            resolved[ri] = Some(Resolved {
+                us: m3[0],
+                _tier: Tier::Hex,
+            });
             anchors.push((h.os, m3[0]));
             continue;
         }
@@ -376,7 +385,8 @@ fn resolve_residual(
         }
         let exp: i64 = match (prev, next) {
             (Some((pe, pu)), Some((ne, nu))) if ne != pe => {
-                pu as i64 + (eu as i64 - pe as i64) * (nu as i64 - pu as i64) / (ne as i64 - pe as i64)
+                pu as i64
+                    + (eu as i64 - pe as i64) * (nu as i64 - pu as i64) / (ne as i64 - pe as i64)
             }
             (Some((pe, pu)), _) => pu as i64 + (eu as i64 - pe as i64),
             (_, Some((ne, nu))) => nu as i64 - (ne as i64 - eu as i64),
@@ -387,12 +397,14 @@ fn resolve_residual(
             .copied()
             .filter(|&c| prev.map_or(true, |(_, pu)| c > pu) && next.map_or(true, |(_, nu)| c < nu))
             .collect();
-        let pool = if order.is_empty() { cands.clone() } else { order };
+        let pool = if order.is_empty() {
+            cands.clone()
+        } else {
+            order
+        };
         let mut sorted = pool.clone();
         sorted.sort_by_key(|&c| ((c as i64 - exp).abs(), c));
-        if sorted.len() >= 2
-            && (sorted[0] as i64 - exp).abs() == (sorted[1] as i64 - exp).abs()
-        {
+        if sorted.len() >= 2 && (sorted[0] as i64 - exp).abs() == (sorted[1] as i64 - exp).abs() {
             crate::bail!(
                 "{}: residual hunk {} (EU line {}) is ambiguous: {} normalized candidates, tie at US line {}",
                 path,
@@ -403,7 +415,10 @@ fn resolve_residual(
             );
         }
         let choice = sorted[0];
-        resolved[ri] = Some(Resolved { us: choice, _tier: Tier::Interp });
+        resolved[ri] = Some(Resolved {
+            us: choice,
+            _tier: Tier::Interp,
+        });
         anchors.push((eu, choice));
         anchors.sort();
     }
@@ -490,6 +505,7 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
     }
     let mut token_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut hex_map: HashMap<i64, i64> = HashMap::new();
+    let mut old_hex: HashSet<i64> = HashSet::new();
     for (o, u) in h.old.iter().zip(us_win.iter()) {
         let ot = token_list(o);
         let ut = token_list(u);
@@ -505,7 +521,11 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
         for (a, b) in ot.into_iter().zip(ut) {
             if let Some(prev) = token_map.get(&a) {
                 if prev != &b {
-                    crate::bail!("{}: conflicting token mapping for {:?}", path, String::from_utf8_lossy(&a));
+                    crate::bail!(
+                        "{}: conflicting token mapping for {:?}",
+                        path,
+                        String::from_utf8_lossy(&a)
+                    );
                 }
             }
             token_map.insert(a, b);
@@ -519,6 +539,7 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
                 h.os
             );
         }
+        old_hex.extend(oh.iter().copied());
         for (a, b) in oh.into_iter().zip(uh) {
             if a != b {
                 if let Some(prev) = hex_map.get(&a) {
@@ -542,6 +563,18 @@ fn rewrite_and_check(path: &str, h: &HunkOwned, us_win: &[Vec<u8>]) -> Result<Ve
                     String::from_utf8_lossy(tok),
                     h.os
                 );
+            }
+        }
+        for (s, e) in scan_hex(line) {
+            if let Some(v) = parse_hex_i64(&line[s..e]) {
+                if !hex_map.contains_key(&v) && !old_hex.contains(&v) {
+                    crate::bail!(
+                        "{}: new-side literal {:?} (hunk at EU line {}) is region-derived but not covered by the hunk map",
+                        path,
+                        String::from_utf8_lossy(&line[s..e]),
+                        h.os
+                    );
+                }
             }
         }
         let r = rewrite_tokens(line, &token_map);
@@ -666,9 +699,9 @@ pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     let resolved = resolve_residual(path, &residual, &lines)?;
     let mut rewrites: Vec<(usize, usize, Vec<Vec<u8>>)> = Vec::new();
     for (ri, h) in residual.iter().enumerate() {
-        let r = resolved[ri].as_ref().ok_or_else(|| {
-            Error(format!("{}: residual hunk {} unresolved", path, ri + 1))
-        })?;
+        let r = resolved[ri]
+            .as_ref()
+            .ok_or_else(|| Error(format!("{}: residual hunk {} unresolved", path, ri + 1)))?;
         let win = &lines[r.us..r.us + h.old.len()];
         let new_lines = rewrite_and_check(path, *h, win)?;
         rewrites.push((r.us, h.old.len(), new_lines));
@@ -677,7 +710,9 @@ pub fn reconcile_cpp(path: &str, base: &[u8], patch: &[u8]) -> Result<Vec<u8>> {
     // Apply rewrites bottom-up so earlier US positions are unaffected.
     rewrites.sort_by(|a, b| b.0.cmp(&a.0));
     for (us, old_len, new_lines) in rewrites {
-        lines.splice(us..us + old_len, new_lines).collect::<Vec<_>>();
+        lines
+            .splice(us..us + old_len, new_lines)
+            .collect::<Vec<_>>();
     }
 
     for line in &mut lines {
@@ -719,28 +754,41 @@ mod tests {
 
     #[test]
     fn mechanical_store_is_exact() {
-        assert_eq!(mechanical(store("0").as_bytes(), stvx16("0").as_bytes()), Some(Mech::Stvx16));
-        assert_eq!(mechanical(store("13").as_bytes(), stvx16("13").as_bytes()), Some(Mech::Stvx16));
+        assert_eq!(
+            mechanical(store("0").as_bytes(), stvx16("0").as_bytes()),
+            Some(Mech::Stvx16)
+        );
+        assert_eq!(
+            mechanical(store("13").as_bytes(), stvx16("13").as_bytes()),
+            Some(Mech::Stvx16)
+        );
     }
 
     #[test]
     fn ambiguous_multi_store_line_is_not_mapped() {
         let two = "{ memcpy(vm_base + (uint32_t)ea, &ctx->vr[0], 16); memcpy(vm_base + (uint32_t)ea, &ctx->vr[1], 16); }\n";
-        let two_new = "{ ppu_stvx16((uint32_t)ea, &ctx->vr[0]); ppu_stvx16((uint32_t)ea, &ctx->vr[1]); }\n";
+        let two_new =
+            "{ ppu_stvx16((uint32_t)ea, &ctx->vr[0]); ppu_stvx16((uint32_t)ea, &ctx->vr[1]); }\n";
         assert_eq!(mechanical(two.as_bytes(), two_new.as_bytes()), None);
     }
 
     #[test]
     fn encoding_noop_is_recognized() {
         assert_eq!(
-            mechanical("/* x \u{2014} y */\n".as_bytes(), "/* x \u{fffd} y */\n".as_bytes()),
+            mechanical(
+                "/* x \u{2014} y */\n".as_bytes(),
+                "/* x \u{fffd} y */\n".as_bytes()
+            ),
             Some(Mech::Encoding)
         );
     }
 
     #[test]
     fn cp1252_dash_is_a_comment_only_noop() {
-        assert_eq!(mechanical("/* trap \u{2014} */\n".as_bytes(), b"/* trap \x97 */\n"), Some(Mech::Encoding));
+        assert_eq!(
+            mechanical("/* trap \u{2014} */\n".as_bytes(), b"/* trap \x97 */\n"),
+            Some(Mech::Encoding)
+        );
         assert_eq!(mechanical(b"a ~ b\n", b"a \x97 b\n"), None);
     }
 
@@ -782,7 +830,10 @@ mod tests {
     fn mechanical_absent_is_not_applicable() {
         // The complete EU old line is absent and no same-register raw store exists -> not a failure.
         let (patch, _) = diff::make_patch(store("0").as_bytes(), stvx16("0").as_bytes(), "f", 1);
-        assert_eq!(reconcile_cpp("f", b"unrelated\n", &patch).unwrap(), b"unrelated\n");
+        assert_eq!(
+            reconcile_cpp("f", b"unrelated\n", &patch).unwrap(),
+            b"unrelated\n"
+        );
     }
 
     #[test]
@@ -812,7 +863,10 @@ mod tests {
         let us = b"ctx->lr = 0x000000B0; func_00000020(ctx);\n";
         let (patch, _) = diff::make_patch(eu_old, eu_new, "f", 0);
         let out = reconcile_cpp("f", us, &patch).unwrap();
-        assert_eq!(out, b"ctx->lr = 0x000000B0; func_00000020(ctx); /* 0xB0 */\n");
+        assert_eq!(
+            out,
+            b"ctx->lr = 0x000000B0; func_00000020(ctx); /* 0xB0 */\n"
+        );
     }
 
     #[test]
@@ -834,9 +888,27 @@ mod tests {
             us.push(format!("f{i}\n").into_bytes());
         }
         us.push(b"ANCHOR_B\n".to_vec());
-        let a = HunkOwned { os: 10, old: vec![b"ANCHOR_A\n".to_vec()], new: vec![b"ANCHOR_A\n".to_vec()], dels: vec![], ins: vec![] };
-        let mid = HunkOwned { os: 50, old: vec![b"goto loc_EE000010;\n".to_vec()], new: vec![b"X\n".to_vec()], dels: vec![b"goto loc_EE000010;\n".to_vec()], ins: vec![b"X\n".to_vec()] };
-        let b = HunkOwned { os: 90, old: vec![b"ANCHOR_B\n".to_vec()], new: vec![b"ANCHOR_B\n".to_vec()], dels: vec![], ins: vec![] };
+        let a = HunkOwned {
+            os: 10,
+            old: vec![b"ANCHOR_A\n".to_vec()],
+            new: vec![b"ANCHOR_A\n".to_vec()],
+            dels: vec![],
+            ins: vec![],
+        };
+        let mid = HunkOwned {
+            os: 50,
+            old: vec![b"goto loc_EE000010;\n".to_vec()],
+            new: vec![b"X\n".to_vec()],
+            dels: vec![b"goto loc_EE000010;\n".to_vec()],
+            ins: vec![b"X\n".to_vec()],
+        };
+        let b = HunkOwned {
+            os: 90,
+            old: vec![b"ANCHOR_B\n".to_vec()],
+            new: vec![b"ANCHOR_B\n".to_vec()],
+            dels: vec![],
+            ins: vec![],
+        };
         let residual = vec![&a, &mid, &b];
         let r = resolve_residual("f", &residual, &us).unwrap();
         let chosen = r[1].as_ref().unwrap().us;
@@ -864,28 +936,72 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn real_data_reconcile_smoke() {
-        // cargo test runs with CWD = the installer crate dir, so the repo root is `..`.
-        let root = std::path::Path::new("../.installer/us/fresh/infamous-recomp/recompiled");
-        let pdir = std::path::Path::new("patches/infamous-recomp/recompiled");
-        if !root.exists() {
-            return;
-        }
-        for name in [
-            "ppu_recomp.h",
-            "ppu_recomp_000.cpp",
-            "ppu_recomp_001.cpp",
-            "ppu_recomp_002.cpp",
-            "ppu_recomp_003.cpp",
-            "ppu_recomp_004.cpp",
-        ] {
-            let base = std::fs::read(root.join(name)).unwrap();
-            let patch = std::fs::read(pdir.join(format!("{name}.patch"))).unwrap();
-            let fin = reconcile(name, &base, &patch, name == "ppu_recomp.h")
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(!fin.windows(3).any(|w| w == b"\xef\xbf\xbd"));
-            eprintln!("{name}: reconciled {} -> {} bytes", base.len(), fin.len());
-        }
+    fn new_side_literal_uncovered_is_rejected() {
+        // The new side introduces a region literal (0xABCD) absent from the old side and any map.
+        let eu = b"x = 0x000000A0;\n";
+        let fin = b"x = 0x000000A0; y = 0x0000ABCD;\n";
+        let (patch, _) = diff::make_patch(eu, fin, "f", 0);
+        let us = b"x = 0x000000B0;\n";
+        let err = reconcile_cpp("f", us, &patch).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("region-derived") && msg.contains("not covered"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fixture_reconcile_covers_tiers_and_rejections() {
+        // Token-normalized residual: func_/loc_ differ, literals identical.
+        let (pa, _) = diff::make_patch(
+            b"if (a) goto func_00000010;  /* loc_00000020 */\n",
+            b"if (a) goto func_00000010;  /* loc_00000020 */ if (hook) return;\n",
+            "f",
+            0,
+        );
+        let oa = reconcile_cpp(
+            "f",
+            b"if (a) goto func_00000099;  /* loc_00000088 */\n",
+            &pa,
+        )
+        .unwrap();
+        assert_eq!(
+            oa,
+            b"if (a) goto func_00000099;  /* loc_00000088 */ if (hook) return;\n"
+        );
+
+        // Hex-normalized residual: literals differ.
+        let (pb, _) = diff::make_patch(
+            b"ctx->lr = 0x000000A0;  /* addr 0xA0 */\n",
+            b"ctx->lr = 0x000000A0;  /* addr 0xA0 */ trap();\n",
+            "f",
+            0,
+        );
+        let ob = reconcile_cpp("f", b"ctx->lr = 0x000000B0;  /* addr 0xB0 */\n", &pb).unwrap();
+        assert_eq!(ob, b"ctx->lr = 0x000000B0;  /* addr 0xB0 */ trap();\n");
+
+        // Uncovered new-side token -> reject.
+        let (pt, _) = diff::make_patch(
+            b"if (x) goto func_00000010;\n",
+            b"if (x) goto func_00000010; goto loc_DEADBEEF;\n",
+            "f",
+            0,
+        );
+        assert!(reconcile_cpp("f", b"if (x) goto func_00000099;\n", &pt)
+            .unwrap_err()
+            .to_string()
+            .contains("not covered"));
+
+        // Uncovered new-side literal -> reject.
+        let (pl, _) = diff::make_patch(
+            b"x = 0x000000A0;\n",
+            b"x = 0x000000A0; y = 0x0000ABCD;\n",
+            "f",
+            0,
+        );
+        assert!(reconcile_cpp("f", b"x = 0x000000B0;\n", &pl)
+            .unwrap_err()
+            .to_string()
+            .contains("region-derived"));
     }
 }

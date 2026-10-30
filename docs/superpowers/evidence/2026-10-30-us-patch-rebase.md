@@ -71,8 +71,24 @@ from the raw US base to the reconciled final source, so `install` reproduces the
 
 ## Hashes
 
-- Patch directory aggregate SHA-256 (93 files): `1e9e5ae6344118745acdf929514191fc54b6f77ca3d403e9f520e34da5723b05`
-- Lock SHA-256: `b64745f2f9a543f6c575f78ca0ee2b6ae54664b3f7cbf6b46d13cf05ea981a40`
+### Patch directory aggregate SHA-256
+
+`1e9e5ae6344118745acdf929514191fc54b6f77ca3d403e9f520e34da5723b05`
+
+Reproducible recipe. The aggregate covers the 93 patch files under `installer/patches/` that are
+not `.ok.patch` placeholders (114 total files minus 21 `.ok.patch` markers). It is computed by:
+
+1. listing every file under `installer/patches/` except `*.ok.patch`;
+2. sorting those repo-root-relative paths lexicographically (byte order, `sort`);
+3. for each file, hashing its bytes with SHA-256 and emitting one `sha256sum` line
+   (`<64-hex-digest>  <relative path>`, with the two-space separator `sha256sum` writes);
+4. hashing the concatenation of those 93 lines with SHA-256.
+
+```bash
+find installer/patches -type f ! -name '*.ok.patch' | sort | xargs sha256sum | sha256sum
+```
+
+Lock SHA-256: `b64745f2f9a543f6c575f78ca0ee2b6ae54664b3f7cbf6b46d13cf05ea981a40`
 
 ## Tests
 

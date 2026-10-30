@@ -7,6 +7,7 @@ inFamous.exe
 
 # Game data must never be committed
 /Infamous (Europe) (Fr,De,Es,It,Nl)
+/Infamous (USA) (En,Fr,Es) (v02.00)
 PS3_GAME/
 *.iso
 *.dkey
