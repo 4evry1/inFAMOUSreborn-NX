@@ -1,0 +1,34 @@
+--- a/infamous-recomp/recompiled/ppu_recomp_000.cpp
++++ b/infamous-recomp/recompiled/ppu_recomp_000.cpp
+@@ -175,6 +175,8 @@
+ extern "C" int ps3_pad_mouse_raw_turn(void);   /* v153 (cellPad.c) */
+ extern "C" void ps3_pad_rstick_read(uint32_t site, uint32_t which, uint32_t kind);   /* v236 (cellPad.c) */
+ extern "C" void car_v233_vis(ppu_context* ctx); extern "C" double car_v233_dscale(ppu_context* ctx);   /* v233A (car_v233.h) */
++extern "C" int infamous_bink_wait_unlock(ppu_context* ctx, uint32_t cond);
++extern "C" void infamous_bink_wait_relock(ppu_context* ctx, int released);
+ 
+ /* Trampoline function pointer for cross-fragment branches (TLS).
+  * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
+@@ -426285,7 +426287,7 @@
+         ctx->gpr[9] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[24], 16, 0, 15);
+         ctx->gpr[20] = vm_read32(ctx->gpr[30] + -0x7FB0);
+         ctx->gpr[0] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[4], 16, 0, 15);
+-        /* PATCH(infamous): movie texture pool not handed over yet -- report "not ready" so the player retries; see stubs.cpp */ { uint32_t infamous_movie_pool(uint32_t); uint32_t _pool = infamous_movie_pool((uint32_t)ctx->gpr[27]); if (!_pool) { ctx->gpr[31] = 0; goto loc_001855EC; } ctx->gpr[21] = _pool; }
++        /* PATCH(infamous): movie texture pool not handed over yet -- release the movie lock and report "not ready"; see stubs.cpp */ { uint32_t infamous_movie_pool(uint32_t); uint32_t _pool = infamous_movie_pool((uint32_t)ctx->gpr[27]); if (!_pool) { ctx->gpr[31] = 0; goto loc_00185254; } ctx->gpr[21] = _pool; }
+         ctx->gpr[9] = ctx->gpr[18] | ctx->gpr[9];
+         ctx->gpr[0] = ctx->gpr[5] | ctx->gpr[0];
+         ctx->ctr = (uint32_t)ctx->gpr[9];
+@@ -428856,7 +428858,12 @@
+         PPU_FENCE(acq_rel);   /* lwsync: everything but StoreLoad */
+         ctx->gpr[4] = (int64_t)(int32_t)(0);
+         ctx->gpr[3] = ppc_rldicl(ctx->gpr[27], 0, 32);
+-        ctx->lr = 0x00187994; func_0055D9A4(ctx); DRAIN_TRAMPOLINE(ctx);
++        ctx->lr = 0x00187994;
++        /* PATCH(infamous): do not hold Bink's IO mutex while sleeping on the
++         * frame condition; the IO thread needs it to publish the read. */
++        int _bink_unlock = infamous_bink_wait_unlock(ctx, (uint32_t)ctx->gpr[3]);
++        func_0055D9A4(ctx); DRAIN_TRAMPOLINE(ctx);
++        infamous_bink_wait_relock(ctx, _bink_unlock);
+         ctx->gpr[2] = 0x0078BF78ULL; /*TOCFIX ld r2,N(r1)*/
+         ctx->gpr[0] = vm_read8(ctx->gpr[29] + 0x5);
+         { int64_t a = (int32_t)ctx->gpr[0]; int64_t b = (int64_t)0; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
