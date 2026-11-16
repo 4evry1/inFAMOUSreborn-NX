@@ -1,3 +1,50 @@
+# inFAMOUS Reborn NX: inFAMOUS for Nintendo Switch
+
+**inFAMOUS (PlayStation 3, 2009) recompiled into a native Nintendo Switch homebrew program. No emulator on the console.**
+
+This is the Nintendo Switch fork of [whompay/inFAMOUSreborn](https://github.com/whompay/inFAMOUSreborn), the native Windows port.
+The fork adds a Switch target in [`switch/`](switch/) next to the PC port. PC downloads, the PC installer and PC bug reports belong to the upstream repository.
+
+> **Status: experimental, not a finished port.** On a Switch the game boots through the menus into gameplay, and saving and loading work.
+> It runs at about 4 frames per second in game (measured on hardware with development build rv71s). Movie (Bink) sound plays; in-game and menu
+> sound are silent. Loading is slow and the opening can stay black for a while because the audio engine runs slowly. Performance and sound are
+> being worked on. Details: [switch/README.md](switch/README.md).
+
+**This fork adds no game files and no ready-made builds.** You build the application yourself, on your own PC, from your own copy of the
+game. The upstream `ps3recomp/fw_spu/` directory carries firmware modules from upstream, unchanged; the Switch port adds none. Only the US
+release (`BCUS98119`, v02.00) is supported.
+
+## Build it from your own disc image
+
+```sh
+export GAME_ISO=/path/to/inFAMOUS.iso GAME_DKEY=/path/to/inFAMOUS.dkey RPCS3=/path/to/rpcs3
+export LIBSRE_SPRX=/path/to/dev_flash/sys/external/libsre.sprx NXVK_DIR=/path/to/nxvk GLSLANG_DIR=/path/to/glslang-switch
+switch/build.sh local 0.1.0        # the .nro lands in switch/build/local-nro-<time>/
+```
+
+**Known gap: one input cannot be generated yet.** The build needs the GCM init image (`switch/native/domain/gcm_init_image.c` and `.h`), a table
+derived from a trace of the firmware's `libgcm_sys`. That derivation is not reproducible from your disc image and firmware alone, and the data is
+firmware-derived, so it is not published. Until you provide those two files the build stops in step 60 with a message naming them. Details in
+[switch/README.md](switch/README.md).
+
+The same steps one at a time (`switch/scripts/10-extract-disc.sh` to `60-build-nro.sh`), what each reads and writes, and how to put the result
+on an SD card are in [switch/README.md](switch/README.md).
+
+## What you need
+
+- **Your own disc image** of the US release: an `.iso` (with its `.dkey` for an encrypted dump), or an extracted folder that contains `PS3_GAME`.
+- **Your own PS3 system software.** The build lifts one system library, `libsre`, from it: install the firmware (`PS3UPDAT.PUP`) in
+  [RPCS3](https://rpcs3.net) and take `libsre.sprx` from its `dev_flash`. RPCS3 also decrypts `EBOOT.BIN` and that library.
+- **A Linux PC** with Python 3.10+, `patch`, Rust (`cargo`, once, for the PC port's installer, which regenerates the game code from your disc), about
+  40 GB of disk and 16 GB of RAM.
+- **The Switch toolchain:** [devkitPro](https://devkitpro.org) (devkitA64, libnx, zlib, expat, SDL2 headers) or Docker with an image that has them.
+- **nxvk** ([PalindromicBreadLoaf/nxvk](https://github.com/PalindromicBreadLoaf/nxvk), commit `c3abea1`) and **glslang**, both built for the Switch.
+- **A Switch that runs homebrew** with an SD card.
+
+Everything below this line is the upstream PC port's README, kept as it is. Its features, numbers and install steps describe the Windows builds, not the Switch one.
+
+---
+
 # inFamous PC
 
 > **Official repo: [github.com/whompay/inFAMOUSreborn](https://github.com/whompay/inFAMOUSreborn).**
