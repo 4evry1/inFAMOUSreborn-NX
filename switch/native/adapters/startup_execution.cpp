@@ -9338,8 +9338,8 @@ namespace savedata_native {
 using namespace savedata_abi;
 namespace sfo = savedata_sfo;
 
-constexpr char save_root[] = "/dev_hdd0/home/" "00000001" "/savedata";
-constexpr const char *save_root_parents[] = {"/dev_hdd0/home", "/dev_hdd0/home/" "00000001", save_root};
+constexpr char save_root[] = "/dev_hdd0/home/00000001/savedata";
+constexpr const char *save_root_parents[] = {"/dev_hdd0/home", "/dev_hdd0/home/00000001", save_root};
 constexpr char param_sfo_name[] = "PARAM.SFO";
 constexpr char trim_suffix[] = ".TRIM";
 constexpr size_t path_bytes = 160;
