@@ -1,0 +1,142 @@
+# Vulkan backend for ps3recomp's RSX draw engine - desktop (host) build.
+#
+# Slices S1, S2 and S3 of the Vulkan backend design:
+# device, staging, submit_and_wait, the descriptor set layouts, clear +
+# readback (S1); the glslang wrapper, the pipelines and the draw (S2); the
+# format table, textures, samplers, colour targets, surface views, depth
+# targets and depth snapshots (S3). Nothing here talks to the Switch; the
+# cross build is the ENABLE_VULKAN hook in native/Makefile (slice S5).
+#
+#   make -f native/adapters/rsx_vulkan/Makefile.vulkan BUILD=build/rsx-vk-s3-1
+#   bash evidence/startup-event-receive-r2/run_bounded.sh 900 \
+#       env VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+#           VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json \
+#           build/rsx-vk-s3-1/test_vk_texture
+#
+# VK_NO_PROTOTYPES is set in every .c so no prototype can be linked against a
+# driver: the entry points come from rsx_vk_platform.c's loader.
+#
+# glslang is built from source under third_party/glslang-<tag>/ because it
+# is not installed on this host and there is no sudo. GLSLANG_PREFIX points at
+# its install tree; GLSLANG_TAG names the directory.
+ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../..)
+SDK    := $(ROOT)/../ps3recomp
+HERE   := $(ROOT)/native/adapters/rsx_vulkan
+BUILD  ?= $(ROOT)/build/rsx-vk-s3
+
+GLSLANG_TAG    ?= 16.6.0
+GLSLANG_PREFIX ?= $(ROOT)/third_party/glslang-$(GLSLANG_TAG)/install
+
+CC     ?= cc
+CXX    ?= c++
+CFLAGS ?= -O1 -g
+CFLAGS += -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter
+CXXFLAGS ?= -O1 -g
+CXXFLAGS += -std=c++17 -Wall -Wextra -Werror -Wno-unused-parameter
+
+CPPFLAGS += -DVK_NO_PROTOTYPES=1 \
+            -I$(SDK)/include \
+            -I$(SDK)/libs/video \
+            -I$(HERE)
+
+# ps3recomp's engine and decompilers are compiled from source/ps3recomp and are
+# NOT edited: the dirs below are read-only inputs. Warnings there are not ours
+# to fix, so -Werror is dropped for those objects only (see $(BUILD)/%.o rules).
+ENGINE_DEFS := -DVK_NO_PROTOTYPES=1
+ENGINE_INC  := -I$(SDK)/include -I$(SDK)/libs/video
+
+LDFLAGS += -lvulkan -ldl
+
+# glslang + the SPIR-V tools its HLSL legalization passes need, all static.
+GLSLANG_LIBS := $(GLSLANG_PREFIX)/lib/libSPIRV.a \
+                $(GLSLANG_PREFIX)/lib/libglslang.a \
+                $(GLSLANG_PREFIX)/lib/libglslang-default-resource-limits.a \
+                $(GLSLANG_PREFIX)/lib/libMachineIndependent.a \
+                $(GLSLANG_PREFIX)/lib/libGenericCodeGen.a \
+                $(GLSLANG_PREFIX)/lib/libOSDependent.a \
+                $(GLSLANG_PREFIX)/lib/libSPIRV-Tools-opt.a \
+                $(GLSLANG_PREFIX)/lib/libSPIRV-Tools.a
+LIBS := $(GLSLANG_LIBS) -lstdc++ -lm -lpthread
+
+BACKEND_SOURCES := $(HERE)/rsx_vk_device.c \
+                   $(HERE)/rsx_vk_platform.c \
+                   $(HERE)/rsx_vk_handle.c \
+                   $(HERE)/rsx_vk_target.c \
+                   $(HERE)/rsx_vk_texture.c \
+                   $(HERE)/rsx_vk_sampler.c \
+                   $(HERE)/rsx_vk_view.c \
+                   $(HERE)/rsx_vk_backend.c \
+                   $(HERE)/rsx_vk_pipeline.c \
+                   $(HERE)/rsx_vk_present.c
+BACKEND_CPP     := $(HERE)/rsx_vk_shader.cpp
+
+# The engine half: rsx_draw_engine drives the vtable and owns the decompilers.
+ENGINE_SOURCES := $(SDK)/libs/video/rsx_draw_engine.c \
+                  $(SDK)/libs/video/rsx_vp_decompiler.c \
+                  $(SDK)/libs/video/rsx_fp_decompiler.c \
+                  $(SDK)/libs/video/rsx_dispatch.c \
+                  $(SDK)/libs/video/rsx_vertex_compact.c \
+                  $(SDK)/libs/video/rsx_texture_layout.c
+
+TEST_DEVICE  := $(HERE)/tests/test_vk_device.c
+TEST_SHADER  := $(HERE)/tests/test_vk_shader.c
+TEST_TEXTURE := $(HERE)/tests/test_vk_texture.c
+
+CACHE_SOURCES   := $(HERE)/rsx_vk_spv_cache.c
+
+BACKEND_OBJECTS := $(patsubst $(HERE)/%.c,$(BUILD)/backend/%.o,$(BACKEND_SOURCES))
+BACKEND_OBJECTS += $(patsubst $(HERE)/%.cpp,$(BUILD)/backend/%.o,$(BACKEND_CPP))
+ENGINE_OBJECTS  := $(patsubst $(SDK)/libs/video/%.c,$(BUILD)/engine/%.o,$(ENGINE_SOURCES))
+CACHE_OBJECTS   := $(patsubst $(HERE)/%.c,$(BUILD)/backend/%.o,$(CACHE_SOURCES))
+
+.PHONY: all clean
+all: $(BUILD)/test_vk_device $(BUILD)/test_vk_shader $(BUILD)/test_vk_texture
+
+# The blob path (rsx_vk_spv_cache.c) needs rsx_vertex_layout_plan_init, so it
+# goes in the engine object set rather than the backend one; test_vk_device
+# links the backend plus rsx_texture_layout.c, which S3's crossbar
+# (rsx_texture_component_remap) needs and which pulls in nothing else.
+TEXTURE_LAYOUT_OBJECT := $(BUILD)/engine/rsx_texture_layout.o
+
+$(BUILD)/test_vk_device: $(BACKEND_OBJECTS) $(TEXTURE_LAYOUT_OBJECT) \
+                         $(BUILD)/tests/test_vk_device.o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) -o $@
+	@echo "built $@"
+
+$(BUILD)/test_vk_shader: $(BACKEND_OBJECTS) $(ENGINE_OBJECTS) $(CACHE_OBJECTS) \
+                         $(BUILD)/tests/test_vk_shader.o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) -o $@
+	@echo "built $@"
+
+# The texture test needs the engine (for its test programs and its
+# decompilers) and rsx_vk_spv_cache.c (for rsx_vertex_layout_plan_init), the
+# same link line as test_vk_shader.
+$(BUILD)/test_vk_texture: $(BACKEND_OBJECTS) $(ENGINE_OBJECTS) $(CACHE_OBJECTS) \
+                          $(BUILD)/tests/test_vk_texture.o
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LIBS) -o $@
+	@echo "built $@"
+
+$(BUILD)/backend/%.o: $(HERE)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/backend/%.o: $(HERE)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) -I$(GLSLANG_PREFIX)/include $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+# ps3recomp: not ours to lint, so -Wall without -Werror.
+$(BUILD)/engine/%.o: $(SDK)/libs/video/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(ENGINE_INC) -O1 -g -std=c11 -MMD -MP -c $< -o $@
+
+$(BUILD)/tests/%.o: $(HERE)/tests/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) -I$(SDK)/include -I$(SDK)/libs/video $(CFLAGS) -MMD -MP \
+	      -c $< -o $@
+
+clean:
+	rm -rf $(BUILD)
+
+-include $(BACKEND_OBJECTS:.o=.d) $(ENGINE_OBJECTS:.o=.d) $(CACHE_OBJECTS:.o=.d) \
+         $(BUILD)/tests/test_vk_device.d $(BUILD)/tests/test_vk_shader.d \
+         $(BUILD)/tests/test_vk_texture.d

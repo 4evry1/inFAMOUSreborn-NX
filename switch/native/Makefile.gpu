@@ -1,0 +1,32 @@
+# Dedicated GPU diagnostic. No guest runtime or shared suite flags are linked.
+ROOT := $(abspath ..)
+BUILD ?= $(ROOT)/build/native-hw-gpu-083
+PROBE_VERSION := 0.8.3
+PROBE_TITLE := inFAMOUS Native GPU Diagnostic
+DEVKITPRO := /opt/devkitpro
+CC := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-gcc
+CXX := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-g++
+CPPFLAGS := -D__SWITCH__ -DPS3_NATIVE_PROBE_VERSION=\"$(PROBE_VERSION)\" -I$(DEVKITPRO)/libnx/include
+CFLAGS := -O2 -g -Wall -Wextra -fPIE -ffunction-sections -fdata-sections -frounding-math -ffp-contract=off -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -MMD -MP
+OBJECTS := $(BUILD)/main.o $(BUILD)/gpu_clear.o $(BUILD)/deko_queue_owner.o $(BUILD)/gpu_clear_test.o
+TARGET := $(BUILD)/infamous-native-gpu
+
+.PHONY: all
+all: $(TARGET).nro
+$(BUILD):
+	mkdir -p $@
+$(BUILD)/main.o: switch_gpu_main.c Makefile.gpu | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu11 -c $< -o $@
+$(BUILD)/gpu_clear.o: adapters/gpu_clear_deko.cpp Makefile.gpu | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CFLAGS) -std=c++17 -Iadapters -c $< -o $@
+$(BUILD)/deko_queue_owner.o: adapters/deko_queue_owner.cpp Makefile.gpu | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CFLAGS) -std=c++17 -Iadapters -c $< -o $@
+$(BUILD)/gpu_clear_test.o: tests/test_gpu_clear.cpp Makefile.gpu | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CFLAGS) -std=c++17 -Iadapters -c $< -o $@
+$(TARGET).elf: $(OBJECTS)
+	$(CXX) -specs=$(DEVKITPRO)/libnx/switch.specs $(CFLAGS) -Wl,--gc-sections,-Map,$(TARGET).map $^ -L$(DEVKITPRO)/libnx/lib -ldeko3d -lnx -lm -o $@
+$(TARGET).nacp: Makefile.gpu | $(BUILD)
+	$(DEVKITPRO)/tools/bin/nacptool --create "$(PROBE_TITLE)" "Local development" "$(PROBE_VERSION)" $@
+$(TARGET).nro: $(TARGET).elf $(TARGET).nacp
+	$(DEVKITPRO)/tools/bin/elf2nro $< $@ --nacp=$(TARGET).nacp
+-include $(OBJECTS:.o=.d)

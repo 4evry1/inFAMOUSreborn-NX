@@ -1,0 +1,68 @@
+[
+ {
+  "unit": "spu_0000_at_005F6000",
+  "elf_offset": "0x5F6000",
+  "what": "Edge zlib inflate task (edgezlib_inflate_task.cpp, zlib 1.2.3.0-PS3-SPU-EDGE), a SPURS task image at LS 0x3000, entry 0x3090; found by the unknown-job dump of console run rv39s (job:d97a9a91, 13.8 G interpreted instructions)",
+  "hooks": {
+   "0x3750": "PS3_NATIVE_INFLATE_HOOK"
+  }
+ },
+ {
+  "unit": "pm_wwsjob",
+  "kind": "policy",
+  "blob_offset": "0x68C880",
+  "blob_size": "0x2D80",
+  "base": "0xA00",
+  "entry": "0x2BF0",
+  "ranges": [
+   [
+    "0xA00",
+    "0xB00"
+   ],
+   [
+    "0x1600",
+    "0x3728"
+   ]
+  ],
+  "stub_ranges": [
+   [
+    "0xB00",
+    "0x1600"
+   ]
+  ],
+  "job_hook_function": "0x31C8",
+  "what": "SPURS policy module pm_wwsjob (libsre WWS job policy module), the blob the SPURS kernel DMAs to LS 0xA00 (EBOOT.elf 0x68C880, 0x2D80 bytes); entry 0x2BF0. CODE ranges [0xA00,0xB00) interrupt glue and [0x1600,0x3728); the variables and tables between them change at run time and are not part of its identity. Function 0x31C8 is the job call (bisle $lr,$r5): the job-window hook sits there."
+ },
+ {
+  "unit": "pm_taskset",
+  "kind": "policy",
+  "input_dir": "native/spu_lifted/jobs/extra/lift_input/pm_taskset",
+  "blob_file": "native/spu_lifted/jobs/extra/lift_input/pm_taskset/body.bin",
+  "base": "0xA00",
+  "entry": "0xA00",
+  "ranges": [
+   [
+    "0xA00",
+    "0x2680"
+   ]
+  ],
+  "stub_ranges": [],
+  "what": "SPURS task-set policy module of libsre.prx (body at libsre image 0x23680, 0x1E40 bytes at LS 0xA00, entry 0xA00); code [0xA00,0x2680) is constant at run time (checked against a console LS dump), its variables [0x2680,0x2840) are not part of its identity. It runs the Edge zlib task and has no job-call hook function: a task is entered by an indirect branch to a task entry, which is a lifted transfer when the task module is armed (composite) and an escape to the interpreter otherwise."
+ },
+ {
+  "unit": "pm_syssrv",
+  "kind": "policy",
+  "input_dir": "native/spu_lifted/jobs/extra/lift_input/pm_syssrv",
+  "blob_file": "native/spu_lifted/jobs/extra/lift_input/pm_syssrv/body.bin",
+  "base": "0xA00",
+  "entry": "0xA00",
+  "ranges": [
+   [
+    "0xA00",
+    "0x2B10"
+   ]
+  ],
+  "stub_ranges": [],
+  "what": "SPURS system service module of libsre.prx (body at libsre image 0x21480, 0x2200 bytes at LS 0xA00, entry 0xA00); code [0xA00,0x2B10). The kernel runs it when no workload is ready: its idle wait (RdEventStat with LR) is where parked threads sit. No job-call hook."
+ }
+]

@@ -1,0 +1,25 @@
+Vendored third-party code: the video library of the inFAMOUS 2 PC port
+=======================================================================
+
+Source:   https://github.com/SamiEnazi/infamous2-port  (MIT licence, see LICENSE in this folder)
+Version:  v0.5.2, upstream commit 4f8d43b ("README: known issues and v0.5.2 speed")
+Layout:   the project's own, with its outer wrapper folder dropped:
+            engine/   libs/video, libs/input, libs/codec (stb), include/ps3emu, runtime/memory/vm.h, third_party/ (post-processing shaders)
+            horizon/  headers and two small sources that stand in for POSIX/desktop APIs on Horizon
+            glue/     ours: stubs, SDL and Vulkan-loader shims that tie the library to this port's render bridge
+            deps/glslang-install-switch/include   glslang headers only; the libraries are not shipped (see switch/README.md)
+
+The library draws the PS3 GPU command stream through Vulkan. In this port it sits behind native/adapters/rsx_render_bridge*.
+Third-party notices that travel with it: engine/third_party/*/LICENSE.txt and SOURCE.txt (AMD FidelityFX CAS and FSR 1, FXAA,
+SMAA), stb headers carry their own notice, glslang headers carry the glslang licence.
+
+Edits made to vendored files (everything else is byte-identical to the upstream files):
+  engine/libs/video/rsx_vulkan_backend.c   render scale 0.5x / 0.75x; pipeline-cache save at most once a minute
+  engine/libs/video/rsx_button_icons.c, engine/libs/video/vk_postfx.c   small Switch adaptations
+  engine/libs/video/rsx_fp_decompiler.c/.h, engine/libs/video/rsx_draw_engine.c
+      PS3RECOMP_ENG_FBFETCH_SCREEN (default 1; 0 = upstream behaviour): the engine used to copy a whole colour target before
+      every G-buffer decal that reads the target it draws into; with the switch on, those draws use framebuffer fetch instead.
+      Marked "(renderer-gap-20261113)" in the sources.
+  glue/sibling_stubs_052_a64.c (new, ours): vk_overlay_lowend_auto() = 0, one symbol the v0.5.2 sources need that this link lacks.
+
+These files are not ours; report issues with them upstream unless the problem is in the edits listed above.
