@@ -5,6 +5,9 @@
  * two rdtsc + one locked add per event -- always on, no env needed. */
 #ifndef PS3EMU_HZ_STATS_H
 #define PS3EMU_HZ_STATS_H
+#include "ps3emu/host_capabilities.h"
+
+#if PS3_HZ_TELEMETRY()
 #include <stdint.h>
 #if defined(_MSC_VER) || defined(_WIN32)
 #include <intrin.h>
@@ -45,4 +48,5 @@ static inline void hz_guest_flip(void)
 #ifdef __cplusplus
 }
 #endif
+#endif /* PS3_HZ_TELEMETRY */
 #endif

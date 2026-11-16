@@ -177,19 +177,9 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
  * r3 = mutex_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
-int64_t sys_mutex_lock(ppu_context* ctx)
+static int64_t lock_mutex_for_thread(sys_mutex_info* m, uint64_t caller_tid,
+                                     uint64_t timeout_us)
 {
-    uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
-    uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
-    if (!m->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    uint64_t caller_tid = ctx->thread_id;
-
     /* Check for deadlock on non-recursive mutex */
     if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
         return (int64_t)(int32_t)CELL_EDEADLK;
@@ -238,6 +228,20 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     m->owner_tid = caller_tid;
     m->lock_count++;
     return CELL_OK;
+}
+
+int64_t sys_mutex_lock(ppu_context* ctx)
+{
+    uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
+    uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    if (!m->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    return lock_mutex_for_thread(m, ctx->thread_id, timeout_us);
 }
 
 /* ---------------------------------------------------------------------------
@@ -306,19 +310,8 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
  *
  * r3 = mutex_id
  * -----------------------------------------------------------------------*/
-int64_t sys_mutex_unlock(ppu_context* ctx)
+static int64_t unlock_mutex_for_thread(sys_mutex_info* m, uint64_t caller_tid)
 {
-    uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
-
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
-    if (!m->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
-
-    uint64_t caller_tid = ctx->thread_id;
-
     if (m->owner_tid != caller_tid) {
         /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
          * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
@@ -340,6 +333,40 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+int64_t sys_mutex_unlock(ppu_context* ctx)
+{
+    uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    if (!m->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    return unlock_mutex_for_thread(m, ctx->thread_id);
+}
+
+int64_t ps3_mutex_lock_for_thread(uint32_t mutex_id, uint64_t thread_id,
+                                  uint64_t timeout_us)
+{
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    if (!m->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    return lock_mutex_for_thread(m, thread_id, timeout_us);
+}
+
+int64_t ps3_mutex_unlock_for_thread(uint32_t mutex_id, uint64_t thread_id)
+{
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    if (!m->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    return unlock_mutex_for_thread(m, thread_id);
 }
 
 /* ---------------------------------------------------------------------------

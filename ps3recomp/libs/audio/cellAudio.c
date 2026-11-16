@@ -1491,7 +1491,8 @@ s32 cellAudioInit(void)
      * that drives its mixer through SPU jobs will otherwise block the whole boot
      * waiting on work we cannot yet complete; failing here lets a title take its
      * silent path and keep going. Diagnostic first, workaround second. */
-    if (getenv("PS3_NO_AUDIO")) {
+    const char* no_audio = getenv("PS3_NO_AUDIO");
+    if (no_audio && *no_audio && strcmp(no_audio, "0") != 0) {
         printf("[cellAudio] PS3_NO_AUDIO -- reporting audio unavailable\n");
         return (s32)CELL_AUDIO_ERROR_NOT_INIT;
     }

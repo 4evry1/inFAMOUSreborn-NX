@@ -247,7 +247,12 @@ s32 cellSysutilCheckCallback(void)
  * spanish, italian, dutch, polish, portuguese, russian, ...) or the CELL_SYSUTIL_LANG_ number; default English (US).
  * inFamous has no language menu: its spoken dialogue, text and subtitles follow this. The title's hook (inFamous:
  * infamous_lang.h) runs when the game reads it. */
-__declspec(selectany) void (*g_sysutil_lang_hook)(int) = NULL;
+#if defined(_WIN32)
+__declspec(selectany)
+#else
+__attribute__((weak))
+#endif
+void (*g_sysutil_lang_hook)(int) = NULL;
 static int sysutil_lang_eq(const char* a, const char* b)
 {
     for (; *a && *b; a++, b++) { char x = *a, y = *b; if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; if (x != y) return 0; }

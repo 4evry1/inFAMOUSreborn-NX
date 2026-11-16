@@ -98,6 +98,7 @@ static void guard_fault(int sig)
  * the group and thread tables to check what they did. */
 #include "../../syscalls/lv2_register.c"
 #include "../spu_helpers.h"
+#include "../spu_dma.h"
 void spu_wrch(spu_context*, uint32_t, u128);
 void spu_overlay_register_region(uint32_t, uint32_t, int);
 void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
@@ -716,6 +717,33 @@ static void test_short_dma_lists(void)
           "short GET list leaves quadword padding untouched");
 }
 
+/* A zero-byte MFC command is legal when its LSA and EA agree on the low four
+ * address bits. It must complete without reading guest memory, including when
+ * the EA is outside the committed arena. The slow path used to return -1 while
+ * the fast path logged the same command as malformed. */
+static void test_zero_length_dma(void)
+{
+    static spu_context ctx;
+    spu_context_init(&ctx, 0);
+    memset(ctx.ls + 0x3C880, 0x5A, 16);
+    const int saved_fast = g_spu_dma_fast;
+
+    for (int fast = 0; fast <= 1; ++fast) {
+        g_spu_dma_fast = fast;
+        check(mfc_do_transfer(&ctx, 0x3C880, 0x499D3E00ull, 0, 0x40) == 0,
+              fast ? "fast path accepts an aligned zero-byte GET"
+                   : "slow path accepts an aligned zero-byte GET");
+    }
+    check(ctx.ls[0x3C880] == 0x5A && ctx.ls[0x3C88F] == 0x5A,
+          "zero-byte GET leaves local store unchanged");
+
+    g_spu_dma_fast = 0;
+    check(mfc_do_transfer(&ctx, 0x3C884, 0x499D3E00ull, 0, 0x40) == -1,
+          "zero-byte GET still rejects mismatched four-bit alignment");
+
+    g_spu_dma_fast = saved_fast;
+}
+
 /* A lifted return through a NON-r0 link register. Sony's SPU compiler links
  * leaf/helper calls through r4/r5/r6/r8/r78 and returns with `bi $rN`; the
  * lifter lowers that to SPU_RET_REG(ctx, N). SPU_RET publishes r0 instead,
@@ -789,6 +817,7 @@ int main(void)
     }
     vm_base = g_guest_mem;
     test_short_dma_lists();
+    test_zero_length_dma();
 
     /* Ask for the group-start diagnostic that reads one title's SPURS instance
      * at a fixed 0x40009D00, a thousand times past the end of this arena, so
@@ -960,7 +989,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 unsigned long long ps3_ms_now(void)              { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
-int      g_barrier_sync_watch = 0;
+uint32_t g_barrier_sync_watch = 0;
 
 /* Title-specific SPURS hooks the SPU half offers but nothing here installs. */
 void (*g_spurs_kernel_hook)(uint32_t) = 0;

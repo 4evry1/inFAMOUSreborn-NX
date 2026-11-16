@@ -4,6 +4,7 @@
 
 #include "sys_timer.h"
 #include "sys_event.h"
+#include "sys_timezone_values.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -332,6 +333,41 @@ int64_t sys_timer_sleep(ppu_context* ctx)
     sleep(sec);
 #endif
 
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_time_get_timezone
+ *
+ * r3 = pointer to receive timezone minutes (s32*)
+ * r4 = pointer to receive summertime minutes (s32*)
+ * -----------------------------------------------------------------------*/
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t timezone_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t summer_addr   = LV2_ARG_PTR(ctx, 1);
+    int bias = 0;
+    int standard_bias = 0;
+    int daylight_bias = 0;
+    int daylight = 0;
+
+#ifdef _WIN32
+    TIME_ZONE_INFORMATION tz = {0};
+    const DWORD state = GetTimeZoneInformation(&tz);
+    bias = tz.Bias;
+    standard_bias = tz.StandardBias;
+    daylight_bias = tz.DaylightBias;
+    daylight = state == TIME_ZONE_ID_DAYLIGHT;
+#endif
+
+    int32_t timezone = 0;
+    int32_t summertime = 0;
+    ps3_timezone_values(bias, standard_bias, daylight_bias, daylight,
+                        &timezone, &summertime);
+    if (timezone_addr)
+        write_be32(timezone_addr, (uint32_t)timezone);
+    if (summer_addr)
+        write_be32(summer_addr, (uint32_t)summertime);
     return CELL_OK;
 }
 
@@ -733,6 +769,7 @@ void sys_timer_init(lv2_syscall_table* tbl)
      * The runtime should dispatch timer_usleep/sleep/get_current_time
      * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,           sys_time_get_timezone);
 
     /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);

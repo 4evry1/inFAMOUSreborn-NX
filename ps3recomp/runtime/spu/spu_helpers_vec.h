@@ -347,4 +347,26 @@ static inline u128 spu__v_rotqmbi(u128 a, u128 b)  { return spu__v_qshr_bits(a, 
 #endif /* v130 */
 
 #endif /* __SSE4_1__ */
+
+/* ---- AArch64 NEON (SPU__NEON, spu_context.h) -------------------------------------------------------------------
+ * The integer ops above are already whole-register NEON operations in spu_helpers.h on AArch64, so the only thing
+ * this header adds there is the SAME diagnostics-free local-store access the SSE build gets: spu_ls_read128 /
+ * spu_ls_write128 in the register-cached sources take the base pointer from the function-local spu_rc_ls instead
+ * of reloading ctx->ls and testing the three diagnostic gates (g_spu_ls_probe, g_spu_ls_watch_n, g_spu_smc_watch --
+ * weak globals, i.e. a GOT load each under -fPIE) on every one of the millions of quadword accesses per frame.
+ * The gates are desktop debugging aids (SPU_LS_WATCH / SPU_LS_LOWREAD / SPU_SMC_WATCH environment variables); a
+ * build that wants them on the lifted code defines SPU_RC_LS_PROBES, exactly as on x86. Same address masking and
+ * byte order as spu_context.h (rev32 == the pshufb of the SSE form). */
+#if SPU__NEON && !defined(SPU_HELPERS_VEC_DISABLE) && !defined(SPU_RC_LS_PROBES)
+static inline __attribute__((always_inline)) u128 spu__v_ls_rd(const uint8_t* ls, uint32_t lsa) {
+    uint8x16_t x = vrev32q_u8(vld1q_u8(ls + (lsa & (SPU_LS_MASK & ~0xFu))));
+    u128 v; memcpy((void*)&v, &x, 16); return v;
+}
+static inline __attribute__((always_inline)) void spu__v_ls_wr(uint8_t* ls, uint32_t lsa, u128 val) {
+    uint8x16_t x; memcpy(&x, &val, 16);
+    vst1q_u8(ls + (lsa & (SPU_LS_MASK & ~0xFu)), vrev32q_u8(x));
+}
+#define spu_ls_read128(c, lsa)       spu__v_ls_rd(spu_rc_ls, (lsa))
+#define spu_ls_write128(c, lsa, val) spu__v_ls_wr(spu_rc_ls, (lsa), (val))
+#endif
 #endif /* SPU_HELPERS_VEC_H */

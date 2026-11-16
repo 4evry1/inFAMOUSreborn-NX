@@ -81,6 +81,12 @@ int64_t sys_mutex_lock(ppu_context* ctx);
 int64_t sys_mutex_trylock(ppu_context* ctx);
 int64_t sys_mutex_unlock(ppu_context* ctx);
 
+/* Host-side helpers for a compatibility handoff that temporarily releases an
+ * owned mutex across a guest wait, preserving owner and recursion accounting. */
+int64_t ps3_mutex_lock_for_thread(uint32_t mutex_id, uint64_t thread_id,
+                                  uint64_t timeout_us);
+int64_t ps3_mutex_unlock_for_thread(uint32_t mutex_id, uint64_t thread_id);
+
 /* Registration */
 void sys_mutex_init(lv2_syscall_table* tbl);
 

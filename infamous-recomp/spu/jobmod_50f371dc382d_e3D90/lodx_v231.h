@@ -9,7 +9,10 @@
  * plane count at params+0x20 to n (main view uses ~35 = frustum + software occluder planes). */
 #ifndef LODX_V231
 #define LODX_V231
+#include "ps3emu/host_capabilities.h"
+#if PS3_HOST_OVERLAY()
 extern volatile int g_lodx_f5_off;   /* rsx_d3d12_backend.c, F5 */
+#endif
 extern volatile float g_v237_lodf;   /* v237B ADAPT_LOD factor (stubs.cpp / infamous_clock_probe.h); 1 = exactly the old path */
 #include "lodx_v233.h"   /* v233B per-class job LOD + LOD_STATS */
 static void lodx_v231_apply_inner(spu_context* ctx, uint32_t p)
@@ -49,7 +52,11 @@ static void lodx_v231_apply_inner(spu_context* ctx, uint32_t p)
         uint32_t n = spu_ls_read32(ctx, p + 0x20);
         if (n > (uint32_t)s_occ && n < 256) spu_ls_write32(ctx, p + 0x20, (uint32_t)s_occ);
     }
-    if (sc == 1.f || g_lodx_f5_off) return;
+    if (sc == 1.f
+#if PS3_HOST_OVERLAY()
+        || g_lodx_f5_off
+#endif
+    ) return;
     const uint32_t t = p + 0x48;
     uint32_t w6 = spu_ls_read32(ctx, t + 24);
     if (w6 & 1u) return;                       /* already scaled (or not the table we expect) */

@@ -456,6 +456,115 @@ void rsx_set_backend(rsx_backend* backend);
 /* Get the current backend (or NULL if none set). */
 rsx_backend* rsx_get_backend(void);
 
+/* ---------------------------------------------------------------------------
+ * Explicit-environment entry (native path)
+ *
+ * Same decoder as rsx_process_method, but every external effect goes through
+ * caller-owned ports and the result is typed. It never reads the global
+ * backend, g_rsx_last_reference, vm_*, getenv or any debug static; built with
+ * PS3_RSX_COMMANDS_NATIVE_ONLY those legacy symbols do not exist at all.
+ * Any non-OK status on a valid env latches it: later calls return
+ * RSX_CMD_ENV_FAILED with no effect (no decode, label, reference or draw) until
+ * rsx_command_env_init. The first failure and its effect (NONE / PARTIAL /
+ * UNKNOWN) are kept in rsx_command_env_failure(); a failed method must not be
+ * retried. See evidence/opus-native-rsx-command-path-r1/REVISED-DESIGN.md
+ * section 3, evidence/opus-native-rsx-command-path-r2/AMENDMENT-DESIGN.md and
+ * evidence/opus-native-rsx-review-fixes-r1/DESIGN-AMENDMENT.md.
+ * -----------------------------------------------------------------------*/
+
+typedef enum rsx_cmd_status {
+    RSX_CMD_OK = 0,
+    RSX_CMD_UNSUPPORTED_METHOD,        /* not implemented for this subchannel/method */
+    RSX_CMD_UNSUPPORTED_SUBCHANNEL,    /* subchannel not bound to NV4097 by the owner */
+    RSX_CMD_UNSUPPORTED_OBJECT,        /* SET_OBJECT handle is not the owner's NV4097 handle */
+    RSX_CMD_UNSUPPORTED_STATE,         /* known method, effect not representable (would be lost) */
+    RSX_CMD_BACKEND_MISSING,           /* a required draw-producing callback is absent */
+    RSX_CMD_BACKEND_REJECTED,
+    RSX_CMD_BACKEND_COMPLETION_UNKNOWN,
+    RSX_CMD_PORT_FAILED,               /* label/reference publication failed */
+    RSX_CMD_INVALID_ENV,               /* null/uninitialised env or state, bad subchannel */
+    RSX_CMD_REENTRANT,                 /* env re-entered from one of its own callbacks */
+    RSX_CMD_ENV_FAILED                 /* env already latched a failure: call refused, no effect */
+} rsx_cmd_status;
+
+/* Effect of a failed call, independent of any FIFO cursor. NONE: guaranteed no
+ * change to rsx_state, env, backend or guest memory. PARTIAL: known partial
+ * application (rsx_state and/or backend touched) and the performer reported the
+ * work NOT performed. UNKNOWN: a performer was invoked and cannot vouch. */
+typedef enum rsx_cmd_effect {
+    RSX_CMD_EFFECT_NONE = 0,
+    RSX_CMD_EFFECT_PARTIAL,
+    RSX_CMD_EFFECT_UNKNOWN
+} rsx_cmd_effect;
+
+typedef enum rsx_cmd_backend_result {
+    RSX_CMD_BACKEND_COMPLETED = 0,
+    RSX_CMD_BACKEND_RESULT_REJECTED,
+    RSX_CMD_BACKEND_RESULT_COMPLETION_UNKNOWN
+} rsx_cmd_backend_result;
+
+typedef enum rsx_cmd_port_result {
+    RSX_CMD_PORT_OK = 0,
+    RSX_CMD_PORT_FAILURE,   /* failed; may have written (effect UNKNOWN) */
+    RSX_CMD_PORT_REFUSED    /* failed and guarantees nothing was written (effect NONE) */
+} rsx_cmd_port_result;
+
+typedef struct rsx_command_ports {
+    /* Borrowed; must outlive every call made with the env. */
+    const rsx_backend* backend;
+    /* Typed outcome of the draw-producing callback just invoked (clear,
+     * draw_arrays incl. immediate END, draw_indexed). Required. */
+    rsx_cmd_backend_result (*backend_result)(void* backend_userdata);
+    void* guest_user;
+    /* label_offset is the 24-bit semaphore offset; value is the word to store
+     * (already byte-swapped for BACK_END_WRITE_SEMAPHORE_RELEASE). Required. */
+    rsx_cmd_port_result (*write_label)(void* guest_user, u32 label_offset, u32 value);
+    /* NV406E_SET_REFERENCE value. Required. */
+    rsx_cmd_port_result (*publish_reference)(void* guest_user, u32 value);
+    /* Bit s set: subchannel s carries the NV4097 object. Nonzero, < 0x100. */
+    u32 nv4097_subchannel_mask;
+    /* SET_OBJECT on those subchannels is accepted only with this handle;
+     * 0 refuses every SET_OBJECT. */
+    u32 nv4097_object_handle;
+} rsx_command_ports;
+
+typedef struct rsx_command_failure {
+    rsx_cmd_status status;
+    rsx_cmd_effect effect;
+    u32 subchannel, method, data;
+} rsx_command_failure;
+
+typedef struct rsx_command_env {
+    u32 magic;
+    rsx_command_ports ports;
+    u32 semaphore_offset;      /* NV4097_SET_SEMAPHORE_OFFSET, per owner */
+    u32 aa_control;            /* NV4097_SET_ANTI_ALIASING_CONTROL, per owner */
+    int busy;
+    int failed;                /* latched: every later call returns ENV_FAILED */
+    int reentry_refused;       /* a callback re-entered during the current call */
+    rsx_cmd_effect decode_effect;  /* internal: effect of the performer outcome of the current call */
+    rsx_command_failure failure;   /* first failure (status RSX_CMD_OK when none) */
+} rsx_command_env;
+
+/* Lifecycle contract (r3, evidence/opus-native-rsx-review-fixes-r1/DESIGN-AMENDMENT.md L1):
+ * *env MUST be zero storage ({0}, memset, static, calloc) or an env previously passed to
+ * this function; init reads magic/busy before writing (uninitialised storage is a
+ * contract violation). Busy (called from one of this env's own callbacks or ports):
+ * returns RSX_CMD_REENTRANT and resets nothing (the outer call then becomes
+ * REENTRANT/UNKNOWN if it would have succeeded; an outer failure is kept). Otherwise
+ * validates every required port and every decoder-reachable backend callback;
+ * INVALID_ENV leaves *env unusable. The only way to clear a latched failure. */
+rsx_cmd_status rsx_command_env_init(rsx_command_env* env, const rsx_command_ports* ports);
+/* Any non-OK result on a valid env latches it (first failure kept). The borrowed
+ * backend (and the env's ports) are snapshotted by value once per call and only the
+ * snapshot is used for that method; changes made by a callback take effect, and are
+ * re-validated, at the next call. Native: a nested BEGIN before END is
+ * RSX_CMD_UNSUPPORTED_STATE (effect NONE). */
+rsx_cmd_status rsx_command_env_method(rsx_command_env* env, rsx_state* state,
+                                      u32 subchannel, u32 method, u32 data);
+/* First latched failure (status RSX_CMD_OK when none); NULL for a NULL env. */
+const rsx_command_failure* rsx_command_env_failure(const rsx_command_env* env);
+
 #ifdef __cplusplus
 }
 #endif

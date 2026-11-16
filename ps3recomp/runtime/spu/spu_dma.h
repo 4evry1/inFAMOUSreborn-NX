@@ -21,12 +21,15 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdio.h>
+#ifndef PS3_NATIVE_SPU_EXECUTOR
 #include "../platform/win32_compat.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#ifndef PS3_NATIVE_SPU_EXECUTOR
 extern uint8_t* vm_base;
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
@@ -73,6 +76,8 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     return 1;
 }
 
+#endif
+
 /* MFC queue depth */
 #define MFC_QUEUE_DEPTH     16
 
@@ -115,10 +120,16 @@ typedef struct mfc_engine {
     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
     uint32_t    tag_completed;
 } mfc_engine;
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+#include "spu_execution_port.h"
+enum { PS3_SPU_EVENT_SN=0x2u };  /* SPU_EVENT_SN stall-and-notify (pinned RPCS3 SPUThread.h event bits) */
+#endif
 
 /* External: pointer to host mapping of PS3 main memory.
  * Must be set by the VM manager before any DMA. */
+#ifndef PS3_NATIVE_SPU_EXECUTOR
 extern uint8_t* vm_base;
+#endif
 
 /* ---------------------------------------------------------------------------
  * Initialization
@@ -150,6 +161,26 @@ static inline int mfc_is_list(uint32_t cmd)
 {
     return (cmd & 0x04) != 0; /* list variants have bit 2 set */
 }
+
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+static inline int mfc_do_transfer(spu_context* spu,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd)
+{
+    ps3_spu_execution_port *port=ps3_spu_execution_for(spu);
+    lsa&=SPU_LS_MASK;
+    port->request=(ps3_spu_transfer){ea,lsa,size,cmd,mfc_is_put(cmd)};
+    port->effect_committed=0;
+    /* Root (2026-11-12): a zero-length get/put moves nothing and completes its tag (hardware and RPCS3 do the same);
+     * inFAMOUS's movie decoder issues one. It was refused, which ended the SPU thread. */
+    if (!size) return 0;
+    if (size>MFC_MAX_DMA_SIZE || size>SPU_LS_SIZE-lsa ||
+        (size>=16 && ((size|lsa|(uint32_t)ea)&15)) ||
+        (size<16 && ((size!=1 && size!=2 && size!=4 && size!=8) || ((lsa|(uint32_t)ea)&(size-1)))))
+        return PS3_SPU_EXEC_UNSUPPORTED;
+    return port->transfer(spu,lsa,ea,size,cmd);
+}
+static inline int mfc_do_transfer_fast(spu_context* spu,uint32_t lsa,uint64_t ea,uint32_t size,uint32_t cmd)
+{ return mfc_do_transfer(spu,lsa,ea,size,cmd); }
+#else
 
 static inline int mfc_is_barrier(uint32_t cmd)
 {
@@ -362,6 +393,14 @@ static inline int mfc_do_transfer_fast(spu_context* spu, uint32_t lsa, uint64_t 
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    /* CBEA permits a zero-byte MFC command. It transfers no data and completes
+     * immediately, but the source and destination must still share the same
+     * four low address bits. inFamous' Bink worker issues such a completion
+     * probe while its movie pipeline is starting. Treating it as malformed
+     * logs a false MFC error and, in the slow path, returns failure even
+     * though the tag is completed by mfc_submit. */
+    if (size == 0)
+        return (((lsa ^ (uint32_t)ea) & 15u) == 0u) ? 0 : -1;
     { extern volatile uint32_t g_ftl_line; extern void ps3_ftl(int, uint32_t, uint32_t);   /* v115 */
       if (g_ftl_line + 1u > 1u && mfc_is_put(cmd) && (uint32_t)ea < g_ftl_line + 128u && (uint32_t)ea + size > g_ftl_line)
           ps3_ftl(3, (uint32_t)ea, size); }
@@ -964,10 +1003,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
  * SPU event 0x2 (MFC DMA list stall-and-notify) and returns -- the WWS
  * jobmanager's interrupt handler processes the arrived portion and writes
  * MFC_WrListStallAck to resume the rest (mfc_list_stall_ack below). */
+#endif
+
 static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                                uint32_t num_left, uint32_t dest_lsa,
                                uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
 {
+#ifndef PS3_NATIVE_SPU_EXECUTOR
     /* v246C V246C_DMAPF bit 1: list lookahead prefetch (GET lists only; exact) */
     const uint32_t v246c_d = (__builtin_expect(g_v246c_dmapf != 0, 0) && mfc_is_get(base_cmd) && vm_base &&
                               (v246c_dmapf_now() & 1)) ? (uint32_t)g_v246c_dmapf_d : 0u;
@@ -977,13 +1019,16 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             const uint32_t psz = spu_ls_read32(spu, pel) & 0x7FFF;
             if (psz) v246c_pf_range(vm_base + spu_ls_read32(spu, pel + 4), psz);
         }
+#endif
     for (uint32_t i = 0; i < num_left; i++) {
         uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
+#ifndef PS3_NATIVE_SPU_EXECUTOR
         if (v246c_d && i + v246c_d < num_left) {
             const uint32_t pel = (elem_lsa + (i + v246c_d) * 8) & SPU_LS_MASK;
             const uint32_t psz = spu_ls_read32(spu, pel) & 0x7FFF;
             if (psz) v246c_pf_range(vm_base + spu_ls_read32(spu, pel + 4), psz);
         }
+#endif
         uint32_t size_and_flags = spu_ls_read32(spu, el);
         uint32_t eal = spu_ls_read32(spu, el + 4);
 
@@ -1006,8 +1051,20 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
 
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+        ps3_spu_execution_port *port=ps3_spu_execution_for(spu);
+        port->progress(spu,(ps3_spu_list_progress){(el+8)&SPU_LS_MASK,num_left-i-1,dest_lsa,tag&31});
+#endif
         if (stall_notify) {
             uint32_t t = tag & 0x1F;
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+            /* A selected SN would set the RdEventStat count / interrupt, which the native owner does not model:
+             * stop before parking or raising (no event manufactured or lost). Unselected SN keeps the old path. */
+            /* Root (2026-11-11): the interpreter owner models both (event status read by RdEventStat, interrupt
+             * taken at the next instruction when enabled), so only a lifted owner still stops here. */
+            if ((spu->event_mask & PS3_SPU_EVENT_SN) && !ps3_spu_execution_delivers_interrupts(spu))
+                return PS3_SPU_EXEC_UNSUPPORTED;
+#endif
             spu->list_stall_elem_lsa[t]  = (el + 8) & SPU_LS_MASK;
             spu->list_stall_remaining[t] = num_left - i - 1;
             spu->list_stall_dest_lsa[t]  = dest_lsa;
@@ -1016,6 +1073,10 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
             spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+            int status=port->checkpoint(spu,PS3_SPU_POST_TRANSFER);
+            if (status) return status;
+#else
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS
@@ -1038,8 +1099,15 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                         spu->ls[0x12A2], spu->ls[0x12A3],
                         spu->ls[0x12A4], spu->ls[0x12A5],
                         spu->ls[0x12A6], spu->ls[0x12A7]); }
+#endif
             return 0;
         }
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+        if (i+1<num_left) {
+            int status=port->checkpoint(spu,PS3_SPU_POST_TRANSFER);
+            if (status) return status;
+        }
+#endif
     }
     return 0;
 }
@@ -1049,6 +1117,16 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
 static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
                                      uint32_t tag)
 {
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    uint32_t t=tag&31;
+    if (!(spu->list_stall_mask&(1u<<t))) return PS3_SPU_EXEC_UNSUPPORTED;
+    ps3_spu_execution_port *port=ps3_spu_execution_for(spu);
+    int preflight=port->begin(spu,spu->list_stall_cmd[t],t,spu->list_stall_elem_lsa[t],
+                             spu->list_stall_ea_base[t],spu->list_stall_remaining[t]*8,1);
+    if (preflight) return preflight;
+    spu->list_stall_mask&=~(1u<<t);
+#else
+
     uint32_t t = tag & 0x1F;
     if (!(spu->list_stall_mask & (1u << t))) {
         static int _n = 0;
@@ -1075,10 +1153,15 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
           fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
                   spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
       fprintf(stderr, "\n"); } }
+#endif
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    if (rc==0 && !(spu->list_stall_mask&(1u<<t)))
+#else
     if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
+#endif
         mfc->tag_completed |= (1u << t);
     return rc;
 }
@@ -1100,6 +1183,11 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
  * -----------------------------------------------------------------------*/
 static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
 {
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    (void)mfc; (void)spu;
+    return PS3_SPU_EXEC_UNSUPPORTED;
+#else
+
     if (mfc->queue_count >= MFC_QUEUE_DEPTH)
         return -1; /* queue full */
 
@@ -1114,6 +1202,7 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
      * the caller should pass it.  We use a wrapper below. */
     (void)cmd;
     return 0;
+#endif
 }
 
 /*
@@ -1122,6 +1211,35 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    uint32_t lsa=spu->mfc_lsa, size=spu->mfc_size, tag=spu->mfc_tag&31;
+    uint64_t ea=((uint64_t)spu->mfc_eah<<32)|spu->mfc_eal;
+    ps3_spu_execution_port *port=ps3_spu_execution_for(spu);
+    port->request=(ps3_spu_transfer){ea,lsa,size,cmd,mfc_is_put(cmd)};
+    port->effect_committed=0;
+    int rc=port->begin(spu,cmd,tag,lsa,ea,size,0);
+    if (rc) return rc;
+    if (spu->list_stall_mask) return PS3_SPU_EXEC_UNSUPPORTED;
+    int sync=cmd==MFC_BARRIER_CMD || cmd==MFC_EIEIO_CMD || cmd==MFC_SYNC_CMD;
+    enum { BARRIER_MODIFIER=1, FENCE_MODIFIER=2, LIST_MODIFIER=4 };
+    uint32_t base=cmd&~(BARRIER_MODIFIER|FENCE_MODIFIER|LIST_MODIFIER);
+    if (!sync && ((base!=MFC_GET_CMD && base!=MFC_PUT_CMD) ||
+        (cmd&(BARRIER_MODIFIER|FENCE_MODIFIER))==(BARRIER_MODIFIER|FENCE_MODIFIER)))
+        return PS3_SPU_EXEC_UNSUPPORTED;
+    /* Root (2026-11-13, console run rv41s): a LIST command's size is the byte length of the element list. Zero (or less than one 8-byte element) is an
+     * empty list: nothing is read or transferred and the tag group completes, exactly like a zero-length plain GET/PUT above (inFAMOUS's SPURS jobs
+     * issue `putl` with size 0; the refusal ended three SPU threads in the same second and froze the game). A length that is not a multiple of 8 runs
+     * its whole elements and ignores the tail (the list runner's own `list_size / 8`, what the desktop port always did). The checks that remain are
+     * for lists that DO have elements: too long, not 8-byte aligned, or running off the local store. */
+    if (!sync && mfc_is_list(cmd) && size>=8 &&
+        (size>MFC_MAX_DMA_SIZE || ((uint32_t)ea&7) || (size&~7u)>SPU_LS_SIZE-((uint32_t)ea&SPU_LS_MASK)))
+        return PS3_SPU_EXEC_UNSUPPORTED;
+    mfc->tag_completed&=~(1u<<tag);
+    if (sync) { __atomic_thread_fence(__ATOMIC_SEQ_CST); rc=0; }
+    else if (mfc_is_list(cmd)) rc=mfc_do_list_transfer(spu,(uint32_t)ea&SPU_LS_MASK,ea&UINT64_C(0xffffffff00000000),size,cmd);
+    else rc=mfc_do_transfer(spu,lsa,ea,size,cmd);
+#else
+
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
@@ -1732,10 +1850,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
+#endif
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    if (rc==0 && !(spu->list_stall_mask&(1u<<tag)))
+#else
     if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+#endif
         mfc->tag_completed |= (1u << tag);
 
     return rc;
@@ -1808,13 +1931,22 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_tag = value & 0x1F;
         break;
     case MFC_Cmd:
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+        { int status=mfc_submit(mfc,spu,value);
+          if (status) ps3_spu_execution_fail(spu,status);
+          ps3_spu_status_reevaluate_tag(spu,mfc->tag_completed);
+          status=ps3_spu_execution_for(spu)->checkpoint(spu,PS3_SPU_POST_COMMAND);
+          if (status) ps3_spu_execution_fail(spu,status); }
+#else
         mfc_submit(mfc, spu, value);
+#endif
         break;
     case MFC_WrTagMask:
         spu->mfc_tag_mask = value;
         break;
     case MFC_WrTagUpdate:
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
+#ifndef PS3_NATIVE_SPU_EXECUTOR
         /* WWS Run-promotion gate probe: after kCommandsExecuted the job manager
          * only calls ChangeLoadToRunJob if `ceq(RdTagStat, tagMask)` holds, i.e.
          * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
@@ -1827,11 +1959,20 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
                       spu->image_id, value, spu->mfc_tag_mask, mfc->tag_completed,
                       spu->mfc_tag_status,
                       (spu->mfc_tag_status == spu->mfc_tag_mask) ? "  (== mask: PROMOTE)" : "  (!= mask: idle)"); } }
+#endif
         break;
     case MFC_WrListStallAck:
         /* Acknowledge a stalled list element's tag group: resume the parked
          * list from the element after the stall point (may stall again). */
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+        { int status=mfc_list_stall_ack(mfc,spu,value);
+          if (status) ps3_spu_execution_fail(spu,status);
+          ps3_spu_status_reevaluate_tag(spu,mfc->tag_completed);
+          status=ps3_spu_execution_for(spu)->checkpoint(spu,PS3_SPU_POST_COMMAND);
+          if (status) ps3_spu_execution_fail(spu,status); }
+#else
         mfc_list_stall_ack(mfc, spu, value);
+#endif
         break;
     default:
         break;
@@ -1841,6 +1982,9 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
 static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
                                          uint32_t channel)
 {
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+    (void)mfc;
+#endif
     switch (channel) {
     case MFC_RdTagStat:
         return spu->mfc_tag_status;

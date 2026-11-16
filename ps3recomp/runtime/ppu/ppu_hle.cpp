@@ -30,6 +30,11 @@
 #endif
 #include <windows.h>   /* v213 HLESTAT: QueryPerformanceCounter */
 #include <intrin.h>
+#else
+#include "../platform/win32_compat.h"
+#if defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 #endif
 #include <time.h>
 #include <stdio.h>

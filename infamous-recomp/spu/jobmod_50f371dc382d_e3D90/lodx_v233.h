@@ -29,6 +29,7 @@
  */
 #ifndef LODX_V233
 #define LODX_V233
+#include "ps3emu/host_capabilities.h"
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -219,7 +220,10 @@ static void lodx233_test(spu_context* ctx, int kind)
     else cull = 1;
     const int view = spu_ls_read32(ctx, p + 0x20) > 8 ? 0 : 1;
     float sc = 1.f;
-    if (!g_lodx_f5_off) {
+#if PS3_HOST_OVERLAY()
+    if (!g_lodx_f5_off)
+#endif
+    {
         if (s_l233_nsets) {
             sc = s_l233_sc[set][cull][cls] * g_l233_sv[set][view];
         }

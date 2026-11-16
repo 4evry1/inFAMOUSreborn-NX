@@ -105,6 +105,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+# Platform helpers used by HLE modules are added explicitly because the runtime
+# glob above intentionally has no CONFIGURE_DEPENDS.
+list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_probe.c")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -375,6 +378,9 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    add_subdirectory(tests/host_file)
+    add_subdirectory(tests/timezone_contract)
+    add_subdirectory(tests/spurs_kernel_startup)
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so

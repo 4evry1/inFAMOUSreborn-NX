@@ -19,6 +19,11 @@
 #include <string>
 
 #include "ppu_recomp.h"
+#include "ps3emu/host_capabilities.h"
+#include "win32_compat.h"
+#ifndef _WIN32
+#include "msvc_compat.h"
+#endif
 /* v237B ADAPT_LOD: adaptive draw-distance factor (infamous_clock_probe.h writes it, lodx_v231.h reads it; 1 = off) */
 extern "C" { volatile float g_v237_lodf = 1.0f; }
 #include "infamous_clock_probe.h"
@@ -147,6 +152,7 @@ static void infamous_hangdump_start(void)
     }).detach();
 }
 
+#if PS3_HOST_OVERLAY()
 // v194: "is the game paused?" for the settings-menu hint (rsx_ui_overlay.c): the world clock (base+4) stands still
 // while the real clock (base+0x24) keeps running -- that is the pause menu (SIM-FROZEN in infamous_clock_probe.h).
 extern "C" int (*volatile g_uiov_paused_fn)(void);
@@ -186,8 +192,6 @@ static int infamous_paused_probe(void)
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 extern "C" volatile int g_uiov_request;   /* rsx_ui_overlay.c */
 extern "C" volatile unsigned long long g_pause_menu_built_ms;   /* rsx_ui_overlay.c: pause watermark */
-struct inf_mbi { void* base; void* abase; unsigned long aprot; unsigned short part; size_t size; unsigned long state, prot, type; };
-extern "C" __declspec(dllimport) size_t __stdcall VirtualQuery(const void*, inf_mbi*, size_t);
 
 static const uint32_t PM_FN_SETTINGS = 0x00FF0000u, PM_FN_QUIT = 0x00FF0010u, PM_FN_TRIM = 0x00FF0020u;
 static const uint32_t PM_TOC = 0x0078BF78u;   /* US module TOC (Task 6) */
@@ -228,8 +232,8 @@ static const uint32_t W_ = 0xFFFFFFFFu;
 static bool pm_readable(uint32_t ea, uint32_t len)
 {
     for (uint64_t a = ea & ~0xFFFull; a < (uint64_t)ea + len; a += 0x1000) {
-        inf_mbi m; if (!VirtualQuery(vm_base + a, &m, sizeof m)) return false;
-        if (m.state != 0x1000 || !m.prot || (m.prot & 0x101)) return false;
+        MEMORY_BASIC_INFORMATION m; if (!VirtualQuery(vm_base + a, &m, sizeof m)) return false;
+        if (m.State != 0x1000 || !m.Protect || (m.Protect & 0x101)) return false;
     }
     return true;
 }
@@ -319,9 +323,9 @@ static void pm_thread()
         static const char k_q[] = "u_menu_quit_demo", k_s[] = "u_menu_restart_demo";
         uint8_t* lo = vm_base + 0x40000000ull; uint8_t* hi = vm_base + 0x60000000ull;
         for (uint8_t* p = lo; p < hi && !(script_done && lq && ls);) {
-            inf_mbi m; if (!VirtualQuery(p, &m, sizeof m)) break;
-            uint8_t* rb = (uint8_t*)m.base; uint8_t* re = rb + m.size; if (re > hi) re = hi;
-            const bool rd = m.state == 0x1000 && !(m.prot & 0x101) && m.prot;
+            MEMORY_BASIC_INFORMATION m; if (!VirtualQuery(p, &m, sizeof m)) break;
+            uint8_t* rb = (uint8_t*)m.BaseAddress; uint8_t* re = rb + m.RegionSize; if (re > hi) re = hi;
+            const bool rd = m.State == 0x1000 && !(m.Protect & 0x101) && m.Protect;
             if (rd) {
                 for (uint8_t* q = (rb < p ? p : rb); q + 32 < re; q += 4) {
                     if (!script_done && q[0] == 0x01 && !std::memcmp(q, PM_ANCHOR_B, 16)) {
@@ -336,7 +340,7 @@ static void pm_thread()
                         else if (!std::memcmp(q, k_s, sizeof k_s)) { if (pm_patch_lang_at(q, sizeof k_s - 1, "Settings")) { ls = true; std::fprintf(stderr, "[pausemenu] text Settings @0x%08X\n", (uint32_t)(q - vm_base)); } }
                     }
             }
-            p = rb + m.size;
+            p = rb + m.RegionSize;
         }
         if (!(script_done && lq && ls)) std::this_thread::sleep_for(seconds(2));
     }
@@ -353,13 +357,21 @@ static void pm_start()
     std::thread(pm_thread).detach();
 }
 
+#endif
+
 extern "C" void ps3_load_prx_modules(void)
 {
+#if PS3_HOST_OVERLAY()
     g_uiov_paused_fn = infamous_paused_probe;
+#endif
     infamous_clock_probe::init();
     ps3_sampler_start();
     infamous_hangdump_start();
+#if PS3_HOST_OVERLAY()
     pm_start();   /* v195 native pause-menu entries */
+#else
+    std::fprintf(stderr, "[ui] host overlay unavailable; original pause menu retained\n");
+#endif
     infamous_trainer_install();   /* F10 trainer (trainer.cpp); TRAINER=0 = off */
     ps3_hle_register_ctx(0x8A85674Du, "_cellSpursLFQueuePushBody",
                          infamous_cellSpursLFQueuePushBody);

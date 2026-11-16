@@ -19,6 +19,7 @@
  */
 
 #include "edat.h"
+#include "../../runtime/platform/host_probe.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -387,11 +388,8 @@ int edat_selftest(void)
  * -----------------------------------------------------------------------*/
 int edat_is_npd(const char* host_path)
 {
-    FILE* f = fopen(host_path, "rb");
-    if (!f) return 0;
     uint8_t m[4] = {0};
-    size_t n = fread(m, 1, 4, f);
-    fclose(f);
+    int n = ps3_host_probe_prefix(host_path, m, sizeof m);
     return n == 4 && m[0] == 'N' && m[1] == 'P' && m[2] == 'D' && m[3] == 0;
 }
 

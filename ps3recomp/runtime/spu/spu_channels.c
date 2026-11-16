@@ -1,3 +1,6 @@
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+#include "spu_channels_native.inc"
+#else
 /*
  * ps3recomp - SPU channel + indirect-branch runtime glue
  *
@@ -4390,3 +4393,5 @@ void spu_dmastat_flush(void)
             g[1] / s / 1000.0, g[3] / s / 1048576.0, g[1] ? (double)g[3] / g[1] : 0.0,
             (g[0] + g[1]) ? 100.0 * g[4] / (double)(g[0] + g[1]) : 0.0, g[5] / s / 1000.0, g[6] / s / 1000.0);
 }
+
+#endif

@@ -55,3 +55,12 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  * never read back. */
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
+
+void spu_interp_set_pending_event(uint32_t data1, uint32_t data2, uint32_t data3)
+{
+    (void)data1;
+    (void)data2;
+    (void)data3;
+}
+
+void spu_interp_clear_pending_event(void) {}

@@ -19,11 +19,16 @@
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include "ps3emu/hz_stats.h"   /* v225A hitch attribution: guest file-read time */
+#include "../platform/host_file.h"
+#include "../platform/win32_compat.h"
+#include <atomic>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <memory>
+#include <mutex>
 #include <thread>   /* v114 */
 #include <chrono>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
@@ -152,13 +157,32 @@ static void host_path(char* out, size_t cap, const char* guest)
 
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
-static FILE* g_files[FS_MAX];
-static uint8_t g_fd_usm[FS_MAX];
-/* Story-cutscene movies currently open (inFamous: movies/cutscene/*.bik other than the startup splash/logo
+using HostFile = ps3recomp::host::File;
+using HostFilePtr = std::shared_ptr<HostFile>;
+struct FsFileEntry {
+    HostFilePtr file;
+    bool usm = false;
+    bool cutscene = false;
+    char path[192] = {};
+};
+struct FsDirEntry {
+    DIR* directory = nullptr;
+    char path[1024] = {};
+    std::mutex io_mutex;
+    ~FsDirEntry()
+    {
+        if (directory)
+            closedir(directory);
+    }
+};
+using FsFileEntryPtr = std::shared_ptr<FsFileEntry>;
+using FsDirEntryPtr = std::shared_ptr<FsDirEntry>;
+static FsFileEntryPtr g_files[FS_MAX];
+static std::mutex g_fd_table_mutex;
+/* Story-cutscene movies currently open (inFamous: BIK files under movies/cutscene other than the startup splash/logo
  * videos). The file stays open for exactly as long as the movie plays; rsx_ui_overlay.c hides the pause
  * watermark while this is non-zero, so it shows in menus and startup videos but not in cutscenes. */
 extern "C" volatile int g_fs_cutscene_open = 0;
-static uint8_t g_fd_cut[FS_MAX];
 static int fs_is_story_cutscene(const char* gpath)
 {
     const char* d = strstr(gpath, "/movies/cutscene/");
@@ -167,19 +191,69 @@ static int fs_is_story_cutscene(const char* gpath)
     if (!strstr(name, ".bik")) return 0;
     return strncmp(name, "splash_", 7) != 0 && strncmp(name, "infamous_logo", 13) != 0;
 }
-static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
-static DIR*  g_dirs[FS_MAX];
-static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
+static FsDirEntryPtr g_dirs[FS_MAX];
 
-static int fd_alloc_file(FILE* f)
+static FsFileEntryPtr fd_file(int fd)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    if (fd < 0 || fd >= FS_MAX) return nullptr;
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    return g_files[fd];
+}
+static FsFileEntryPtr fd_detach_file(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX) return nullptr;
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    FsFileEntryPtr entry = std::move(g_files[fd]);
+    if (entry && entry->cutscene)
+        InterlockedDecrement((volatile LONG*)&g_fs_cutscene_open);
+    return entry;
+}
+static FsDirEntryPtr fd_dir(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX) return nullptr;
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    return g_dirs[fd];
+}
+static FsDirEntryPtr fd_detach_dir(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX) return nullptr;
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    return std::move(g_dirs[fd]);
+}
+static int fd_alloc_file(FsFileEntryPtr entry)
+{
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    for (int i = 3; i < FS_MAX; i++) {
+        if (!g_files[i] && !g_dirs[i]) {
+            g_files[i] = std::move(entry);
+            if (g_files[i]->cutscene)
+                InterlockedIncrement((volatile LONG*)&g_fs_cutscene_open);
+            return i;
+        }
+    }
     return -1;
 }
-static int fd_alloc_dir(DIR* d)
+static int fd_alloc_dir(FsDirEntryPtr entry)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
+    std::lock_guard<std::mutex> lock(g_fd_table_mutex);
+    for (int i = 3; i < FS_MAX; i++)
+        if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = std::move(entry); return i; }
     return -1;
+}
+
+static ps3recomp::host::OpenOptions host_open_options(uint32_t flags)
+{
+    ps3recomp::host::OpenOptions options;
+    const uint32_t access = flags & 0x3;
+    options.access = access == CELL_FS_O_RDWR
+        ? ps3recomp::host::FileAccess::read_write
+        : access == CELL_FS_O_WRONLY
+            ? ps3recomp::host::FileAccess::write_only
+            : ps3recomp::host::FileAccess::read_only;
+    options.create = (flags & CELL_FS_O_CREAT) != 0;
+    options.truncate = (flags & CELL_FS_O_TRUNC) != 0;
+    options.append = (flags & CELL_FS_O_APPEND) != 0;
+    return options;
 }
 
 /* ---- handlers ---- */
@@ -197,18 +271,6 @@ static void cellFsOpen(ppu_context* ctx)
       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
-    /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
-     * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
-     * real open() flags from the access mode (low 2 bits) + the modifiers, then
-     * wrap the fd in a FILE* with fdopen() (which neither creates nor truncates
-     * -- that was already decided by open()). */
-    int acc = flags & 0x3;
-    int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
-               : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
-    if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
-    if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
-    if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
-
     /* A bare device root ("/dev_bdvd") resolves to a DIRECTORY, and open() on a
      * directory fails on Windows. Real cellFsOpen answers EISDIR there, and a
      * title reads that as "the medium is mounted" -- YDKJ probes the disc this
@@ -222,32 +284,25 @@ static void cellFsOpen(ppu_context* ctx)
             return;
         }
     }
-    int hfd = open(hpath, oflags | O_BINARY, 0666);
-    if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+    int host_error = 0;
+    HostFilePtr file = HostFile::open(hpath, host_open_options(flags), &host_error);
+    if (!file) {
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (host error %d)\n",
+                gpath, hpath, host_error);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
-    const char* fmode = (acc == CELL_FS_O_RDWR)
-                        ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
-                        : (acc == CELL_FS_O_WRONLY)
-                          ? ((flags & CELL_FS_O_APPEND) ? "ab" : "wb")
-                          : "rb";
-    FILE* f = fdopen(hfd, fmode);
-    if (!f) {
-        close(hfd);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
-    }
-    int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    auto entry = std::make_shared<FsFileEntry>();
+    entry->file = std::move(file);
+    entry->usm = strstr(gpath, ".usm") != nullptr;
+    entry->cutscene = fs_is_story_cutscene(gpath) != 0;
+    strncpy(entry->path, gpath, sizeof(entry->path) - 1);
+    int fd = fd_alloc_file(entry);
+    if (fd < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-    g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
-    g_fd_cut[fd] = (uint8_t)fs_is_story_cutscene(gpath);
-    if (g_fd_cut[fd]) g_fs_cutscene_open++;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
      * movies) is diagnosed from the opener: its sibling read path is the one
      * that is not running. */
-    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
     { char who[64] = "?";
       if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
           fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
@@ -257,7 +312,8 @@ static void cellFsOpen(ppu_context* ctx)
           { const char* want = getenv("FS_STACK");
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+      else if (getenv("FS_OPEN_LOG"))
+          fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -299,27 +355,27 @@ static void cellFsSdataOpen(ppu_context* ctx)
       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
 
-    int hfd = open(hpath, O_RDONLY | O_BINARY, 0666);
-    if (hfd < 0) {
-        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
+    int host_error = 0;
+    HostFilePtr file = HostFile::open(
+        hpath, {ps3recomp::host::FileAccess::read_only, false, false, false},
+        &host_error);
+    if (!file) {
+        fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s' (host error %d)\n",
+                gpath, hpath, host_error);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
-    FILE* f = fdopen(hfd, "rb");
-    if (!f) { close(hfd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-    /* If the file IS still NPD-encrypted, we can't serve it plaintext here --
-     * warn loudly rather than hand back ciphertext the title will choke on.
-     * Use portable fread/fseek (POSIX read()/ssize_t aren't available under the
-     * exe's compiler). */
+    /* If the file IS still NPD-encrypted, decrypt it in full and serve the
+     * plaintext from a native temporary handle. */
     unsigned char magic[4] = {0};
-    size_t got = fread(magic, 1, 4, f);
-    fseek(f, 0, SEEK_SET);
+    size_t got = file->read(magic, sizeof magic);
+    file->seek(0, SEEK_SET);
     if (got == 4 && magic[0]=='N' && magic[1]=='P' && magic[2]=='D') {
-        /* NPD-encrypted SDATA: decrypt it in full and serve the plaintext from
-         * an anonymous tmpfile so the title's reads see the real container. */
-        fseek(f, 0, SEEK_END); long enc_sz = ftell(f); fseek(f, 0, SEEK_SET);
-        uint8_t* enc = (enc_sz > 0) ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
-        size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
-        fclose(f);
+        const uint64_t enc_sz = file->size();
+        uint8_t* enc = (enc_sz > 0 && enc_sz <= SIZE_MAX)
+            ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
+        file->seek(0, SEEK_SET);
+        size_t rd = enc ? file->read(enc, (size_t)enc_sz) : 0;
+        file.reset();
         size_t dec_sz = 0;
         uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
         free(enc);
@@ -330,15 +386,17 @@ static void cellFsSdataOpen(ppu_context* ctx)
         }
         char dmagic[4] = {0};
         if (dec_sz >= 4) memcpy(dmagic, dec, 4);
-        FILE* tf = tmpfile();
-        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
-            if (tf) fclose(tf); free(dec);
+        HostFilePtr temporary = HostFile::temporary(&host_error);
+        if (!temporary || temporary->write(dec, dec_sz) != dec_sz ||
+            !temporary->seek(0, SEEK_SET)) {
+            free(dec);
             ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
         }
         free(dec);
-        rewind(tf);
-        int fd = fd_alloc_file(tf);
-        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+        auto entry = std::make_shared<FsFileEntry>();
+        entry->file = std::move(temporary);
+        int fd = fd_alloc_file(entry);
+        if (fd < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
                 gpath, fd, dec_sz,
@@ -347,8 +405,11 @@ static void cellFsSdataOpen(ppu_context* ctx)
         ctx->gpr[3] = CELL_OK;
         return;
     }
-    int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    auto entry = std::make_shared<FsFileEntry>();
+    entry->file = std::move(file);
+    strncpy(entry->path, gpath, sizeof(entry->path) - 1);
+    int fd = fd_alloc_file(entry);
+    if (fd < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
@@ -360,11 +421,9 @@ static void cellFsClose(ppu_context* ctx)
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-        if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
-        fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
-        if (g_fd_cut[fd]) { g_fd_cut[fd] = 0; if (g_fs_cutscene_open > 0) g_fs_cutscene_open--; }
-    }
+    FsFileEntryPtr entry = fd_detach_file(fd);
+    if (entry && entry->usm && getenv("PS3_FSLOG_READS"))
+        fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -372,9 +431,9 @@ static void cellFsClose(ppu_context* ctx)
  *
  * The flat VM is MEM_RESERVEd and each page is committed on FIRST ACCESS by a
  * vectored exception handler. That covers CPU access from lifted code, but
- * fread/fwrite move data through the kernel, and a kernel write to a reserved
+ * host reads/writes move data through the kernel, and a kernel write to a reserved
  * page does not raise a user-mode exception -- the I/O just fails, returning 0
- * with ferror set. Twisted Metal hit this on every read whose destination the
+ * with a host error. Twisted Metal hit this on every read whose destination the
  * guest had not touched yet: read 1 of a file succeeded, read 2 into a fresh
  * page came back n=0 eof=0 err=1, and the title logged its own
  * "Short read ... Possible reasons include disc eject" and gave up.
@@ -392,19 +451,30 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
 
 static void cellFsRead(ppu_context* ctx)
 {
+    const auto phase_start = std::chrono::steady_clock::now();
     int fd          = (int)(uint32_t)ctx->gpr[3];
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FsFileEntryPtr entry = fd_file(fd);
+    const auto phase_lookup = std::chrono::steady_clock::now();
+    if (!entry) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    HostFilePtr file = entry->file;
     uint64_t raw_nbytes = ctx->gpr[5];
-    long fpos_before = ftell(g_files[fd]);
+    long fpos_before = (long)file->position();
+    const auto phase_position = std::chrono::steady_clock::now();
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    const auto phase_prefault = std::chrono::steady_clock::now();
+#if PS3_HZ_TELEMETRY()
     const unsigned long long _hz0 = hz_tsc();   /* v225A */
-    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+#endif
+    size_t n = file->read(vm_base + buf, (size_t)nbytes);   /* raw bytes, no swap */
+    const auto phase_read = std::chrono::steady_clock::now();
+#if PS3_HZ_TELEMETRY()
     { const long long _hzd = (long long)(hz_tsc() - _hz0); hz_add(HZ_FS_TSC, _hzd); hz_add(HZ_FS_N, 1); hz_add(HZ_FS_BYTES, (long long)n);
       if (ps3_hz_is_main()) { hz_add(HZ_FS_MAIN_TSC, _hzd); hz_add(HZ_FS_MAIN_N, 1); } }
+#endif
     /* v114 FS_READ_DELAY_MS=<ms> (default 0 = off): CAUSAL TEST, not a fix. Sleep after every exactly-64 KB
      * read (the FIOS world-streaming chunks of infamous1.psarc_s; loading reads are ~490 KB and unaffected).
      * If the world-movement hitches get longer by about the added burst time, streaming speed causes them. */
@@ -426,7 +496,7 @@ static void cellFsRead(ppu_context* ctx)
           if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
           n = 0;
       } }
-    if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
+    if (entry->usm && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
      * lines and they are all spent before a movie ever opens, so it cannot
      * answer "is the streamer reading the .avi". */
@@ -435,7 +505,7 @@ static void cellFsRead(ppu_context* ctx)
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (getenv("PS3_FSLOG")) { static int _fd=0; if((_fd < 20 && _fd++ < 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+    if (getenv("PS3_FSLOG")) { static int _fd=0; if((_fd < 20 && _fd++ < 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu host_err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,file->last_host_error()); }
 #ifdef _WIN32
     if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if((_b < 2 && _b++ < 2)){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
@@ -444,20 +514,26 @@ static void cellFsRead(ppu_context* ctx)
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
      * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
+    { static uint64_t tot=0, read_count=0; static int _n=0;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
+      read_count++;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
-      int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if((_n < 50 && _n++ < 50) || first_for_fd || getenv("FS_READ_ALL"))
-        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
-                fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
-                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
-      if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
-          fprintf(stderr, "        from %s\n", g_fd_path[fd]);
-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
-          for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
-          fprintf(stderr,"\n"); } }
+      const bool read_log = getenv("FS_READ_LOG") != nullptr;
+      if (read_log) {
+          const int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+          if ((_n < 50 && _n++ < 50) || first_for_fd || getenv("FS_READ_ALL"))
+              fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
+                      fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
+                      (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+          if ((read_count % 2000)==0) { fprintf(stderr,"[fs] read summary after %llu reads:",(unsigned long long)read_count);
+              for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
+              fprintf(stderr,"\n");
+          }
+      }
+      if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && entry->path[0])
+          fprintf(stderr, "        from %s\n", entry->path);
+    }
     if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
         fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
         uint32_t sp = (uint32_t)ctx->gpr[1];
@@ -465,6 +541,23 @@ static void cellFsRead(ppu_context* ctx)
             uint32_t a = sp + i*4; uint32_t w = (vm_base[a]<<24)|(vm_base[a+1]<<16)|(vm_base[a+2]<<8)|vm_base[a+3];
             if (w >= 0x10000u && w < 0x600000u) fprintf(stderr, "[TOC]   ra 0x%08X (@sp+0x%X)\n", w, i*4);
         }
+    }
+    const auto phase_end = std::chrono::steady_clock::now();
+    auto ms = [](auto from, auto to) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+    };
+    if (ms(phase_start, phase_end) >= 100) {
+        fprintf(stderr,
+                "[FSPHASE] tid=%llu fd=%d want=%llu got=%zu total=%lldms "
+                "lookup=%lld position=%lld prefault=%lld read=%lld post=%lld\n",
+                (unsigned long long)ctx->thread_id, fd,
+                (unsigned long long)raw_nbytes, n,
+                (long long)ms(phase_start, phase_end),
+                (long long)ms(phase_start, phase_lookup),
+                (long long)ms(phase_lookup, phase_position),
+                (long long)ms(phase_position, phase_prefault),
+                (long long)ms(phase_prefault, phase_read),
+                (long long)ms(phase_read, phase_end));
     }
     if (nread_ptr) vm_write64(nread_ptr, n);
     ctx->gpr[3] = CELL_OK;
@@ -476,9 +569,11 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FsFileEntryPtr entry = fd_file(fd);
+    if (!entry) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    HostFilePtr file = entry->file;
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
-    size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    size_t n = file->write(vm_base + buf, (size_t)nbytes);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -536,7 +631,8 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
 static void cellFsFGetBlockSize(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+    FsFileEntryPtr entry = fd_file(fd);
+    if (!entry) {
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
         return;
     }
@@ -556,12 +652,14 @@ static void cellFsLseek(ppu_context* ctx)
     int64_t off   = (int64_t)ctx->gpr[4];
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FsFileEntryPtr entry = fd_file(fd);
+    if (!entry) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    HostFilePtr file = entry->file;
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    file->seek(off, worigin);
+    const int64_t p = file->position();
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -609,13 +707,12 @@ static void cellFsFstat(ppu_context* ctx)
 {
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    FsFileEntryPtr entry = fd_file(fd);
+    if (!entry) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    HostFilePtr file = entry->file;
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    uint64_t sz = file->size();
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -623,13 +720,14 @@ static void cellFsFstat(ppu_context* ctx)
      * path. Answers whether the split is size-based -- nothing more. */
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
-      if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
-          if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
-              sz = c; } } }
-    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if((_n < 12 && _n++ < 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+      if (cap && only && *only && !(entry->path[0] && strstr(entry->path, only))) cap = 0;
+      if (cap) { long long c = strtoll(cap, 0, 0);
+          if (c > 0 && sz > (uint64_t)c) {
+              fprintf(stderr, "[fs] fstat fd=%d size %llu -> capped %lld (FS_FSTAT_CAP)\n",
+                      fd, (unsigned long long)sz, c);
+              sz = (uint64_t)c; } } }
+    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, sz);
+    if (getenv("PS3_FSLOG")) { static int _n=0; if((_n < 12 && _n++ < 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -642,9 +740,11 @@ static void cellFsOpendir(ppu_context* ctx)
     DIR* d = opendir(hpath);
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
-    int fd = fd_alloc_dir(d);
-    if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-    strncpy(g_dir_path[fd], hpath, sizeof g_dir_path[fd] - 1);
+    auto entry = std::make_shared<FsDirEntry>();
+    entry->directory = d;
+    strncpy(entry->path, hpath, sizeof(entry->path) - 1);
+    int fd = fd_alloc_dir(entry);
+    if (fd < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     ctx->gpr[3] = CELL_OK;
 }
@@ -655,11 +755,14 @@ static void cellFsReaddir(ppu_context* ctx)
     int fd          = (int)(uint32_t)ctx->gpr[3];
     uint32_t dirent = (uint32_t)ctx->gpr[4];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
-    if (fd < 0 || fd >= FS_MAX || !g_dirs[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-    struct dirent* e = readdir(g_dirs[fd]);
+    FsDirEntryPtr entry = fd_dir(fd);
+    if (!entry) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    std::lock_guard<std::mutex> io_lock(entry->io_mutex);
+    if (!entry->directory) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    struct dirent* e = readdir(entry->directory);
     if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
     char full[1300]; struct stat st;
-    snprintf(full, sizeof full, "%s/%s", g_dir_path[fd], e->d_name);
+    snprintf(full, sizeof full, "%s/%s", entry->path, e->d_name);
     uint8_t type = (stat(full, &st) == 0 && (st.st_mode & S_IFDIR))
                    ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
     size_t nl = strlen(e->d_name); if (nl > 255) nl = 255;
@@ -674,7 +777,12 @@ static void cellFsReaddir(ppu_context* ctx)
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd >= 0 && fd < FS_MAX && g_dirs[fd]) { closedir(g_dirs[fd]); g_dirs[fd] = nullptr; }
+    FsDirEntryPtr entry = fd_detach_dir(fd);
+    if (entry) {
+        std::lock_guard<std::mutex> io_lock(entry->io_mutex);
+        closedir(entry->directory);
+        entry->directory = nullptr;
+    }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -718,7 +826,8 @@ static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 static void cellFsFsync(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
+    FsFileEntryPtr entry = fd_file(fd);
+    if (entry) entry->file->flush();
     ctx->gpr[3] = CELL_OK;
 }
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
@@ -741,12 +850,6 @@ static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3
  * submit call returns. A title that submits, THEN arms the thing the callback
  * signals, would miss it -- move completion to a worker thread if one shows up.
  */
-#ifdef _WIN32
-#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
-#else
-#  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
-#endif
-
 static uint32_t guest_be32(uint32_t a)
 {
     if (ppu_vm_size && (uint64_t)a + 4 > ppu_vm_size) return 0;
@@ -776,22 +879,27 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static int32_t s_next_id = 1;
-    int32_t id = s_next_id++;
+    static std::atomic<int32_t> s_next_id{1};
+    int32_t id = s_next_id.fetch_add(1, std::memory_order_relaxed);
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+    FsFileEntryPtr entry = fd_file(fd);
+    if (entry) {
+        HostFilePtr file = entry->file;
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
         /* AIO reads are absolute -- they do not disturb the fd's own file
          * position, and the guest interleaves them freely across threads. */
+#if PS3_HZ_TELEMETRY()
         const unsigned long long _hz0 = hz_tsc();   /* v225A */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+#endif
+        n = file->read_at(offset, vm_base + buf, (size_t)size);
+#if PS3_HZ_TELEMETRY()
         { const long long _hzd = (long long)(hz_tsc() - _hz0); hz_add(HZ_FS_TSC, _hzd); hz_add(HZ_FS_N, 1); hz_add(HZ_FS_BYTES, (long long)n);
           if (ps3_hz_is_main()) { hz_add(HZ_FS_MAIN_TSC, _hzd); hz_add(HZ_FS_MAIN_N, 1); } }
+#endif
         err = CELL_OK;
     }
     if (getenv("PS3_FSLOG"))

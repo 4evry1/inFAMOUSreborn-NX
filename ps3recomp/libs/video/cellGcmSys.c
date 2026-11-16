@@ -1560,6 +1560,7 @@ int v243c_rfbound_on(void)
     return on;
 }
 static volatile long long g_v243c_last_put_qpc = 0;
+#if PS3_HZ_TELEMETRY()
 static void v243c_fence_note(void)
 {
     extern int ps3_hz_is_main(void);
@@ -1581,9 +1582,12 @@ static void v243c_fence_note(void)
     last = now.QuadPart;
     g_v243c_st[7] = now.QuadPart;
 }
+#endif
 void cellGcm_ref_on_poll(void)
 {
+#if PS3_HZ_TELEMETRY()
     if (__builtin_expect(v243c_rfbound_on(), 0)) v243c_fence_note();   /* v243C RFBOUND */
+#endif
     /* Pace: leave each published value observable for >= ~200us of spins
      * (equality-waiters at any poll rate see every value; still ~5000/s so
      * loading's fence storms clear in seconds, not minutes). */
@@ -1688,7 +1692,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+#if PS3_RSX_WRITE_WATCH_CACHE()
     { extern void rsx_ww_bump(void); rsx_ww_bump(); }   /* v219 VC_WW: data behind a new put may be newer than the last poll */
+#endif
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
      * in order; on arm64 it does not, so without an acquire here the ring
@@ -2037,7 +2043,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x68u) { static unsigned long s_acq = 0; if (((++s_acq) & 0x3FFFu) == 1)   /* v173 diag */
                         fprintf(stderr, "[SEMA] NV406E acquire #%lu: label 0x%X = 0x%08X, want 0x%08X%c", s_acq, la, vm_read32(la), v, 10); }
+#if PS3_RSX_WRITE_WATCH_CACHE()
                     if (m == 0x68u) { extern void rsx_ww_bump(void); rsx_ww_bump(); }   /* v219 VC_WW: SPU-released data */
+#endif
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) { extern void (*g_rsx_vtx_sync)(void); if (g_rsx_vtx_sync) g_rsx_vtx_sync(); vm_write32(la, v); }
                     else if (m == 0x68u && vm_read32(la) != v) {
@@ -2818,7 +2826,9 @@ static void gcm_flip_note_into_fifo(u32 bufferId)
 }
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+#if PS3_HZ_TELEMETRY()
     hz_guest_flip();   /* v225A */
+#endif
     if (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId])
         g_gcm_last_flip_off = s_display_buffers[bufferId].offset;
     /* FRAME_DRAWS=1: primitive batches per frame. Prints "[world] FIRST BIG FRAME"

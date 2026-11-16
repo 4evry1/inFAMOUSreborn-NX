@@ -106,6 +106,7 @@ typedef struct {
     u32 handle;
     u64 content_hash;
     u32 last_hash_frame;
+    u32 stable_checks;      /* consecutive checks that found the bytes unchanged (Decision 93) */
     u64 last_use_serial;
 } eng_texture;
 
@@ -187,6 +188,12 @@ static struct {
      * FIFO rather than from a vertex array. */
     const u8* inl;
     u32 inl_bytes;
+
+    /* Immediate mode (root, 2026-11-12): SET_VERTEX_DATA* written between
+     * BEGIN_END(prim) and BEGIN_END(0). Writing attribute 0 emits a vertex that
+     * carries the current value of all sixteen attributes. */
+    float (*imm)[RSX_DSP_NUM_VERTEX_ATTR][4];
+    u32 n_imm, cap_imm;
 } dc;
 
 /* ---- guest memory -------------------------------------------------------- */
@@ -797,7 +804,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0))
             continue;
-        if (e->handle && e->last_hash_frame != g.frames) {
+        /* Root (2026-11-12, Decision 93): a texture whose bytes did not change is checked less often: every
+         * frame at first, then every 2nd, 4th and at most every 8th frame. A scene of some hundred textures was
+         * hashing all of their bytes on every frame; a texture that does change (a movie frame, a glyph cache)
+         * drops back to every frame at once and can be at most 7 frames late after a quiet spell. */
+        const u32 check_interval = 1u << (e->stable_checks < 3u ? e->stable_checks : 3u);
+        if (e->handle && (u32)(g.frames - e->last_hash_frame) >= check_interval) {
             int readable = 0;
             const u64 hash = eng_texture_content_hash(location, offset, span,
                                                       &readable);
@@ -805,11 +817,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             if (readable && hash != e->content_hash) {
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap);
+                e->stable_checks = 0;
                 if (fresh) {
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
                     e->content_hash = hash;
                 }
+            } else if (e->stable_checks < 3u) {
+                e->stable_checks++;
             }
         }
         e->last_use_serial = ++g.texture_use_serial;
@@ -1106,6 +1121,52 @@ static void dc_reset(void)
     dc.fetch_ok = 1;
     dc.inl = NULL;
     dc.inl_bytes = 0;
+    dc.n_imm = 0;
+}
+
+/* The method that completes attribute 0 in each SET_VERTEX_DATA* form. */
+static int eng_imm_provokes(u32 m)
+{
+    return m == 0x1884u /* 2F */ || m == 0x1508u /* 3F */ || m == 0x1C0Cu /* 4F */ ||
+           m == 0x1900u /* 2S */ || m == 0x1940u /* 4UB */ || m == 0x1984u /* 4S */ ||
+           m == 0x1E40u /* 1F */;
+}
+
+static void dc_imm_push(void)
+{
+    if (dc.n_imm >= dc.cap_imm) {
+        const u32 next = dc.cap_imm ? dc.cap_imm * 2u : 64u;
+        void* p = realloc(dc.imm, (size_t)next * sizeof(*dc.imm));
+        if (!p) return;
+        dc.imm = (float (*)[RSX_DSP_NUM_VERTEX_ATTR][4])p;
+        dc.cap_imm = next;
+    }
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++)
+        rsx_dsp_vertex_default(&g.rsx, attr, dc.imm[dc.n_imm][attr]);
+    dc.n_imm++;
+}
+
+static int dc_reserve_verts(u64 bytes);
+
+/* Build the host vertices of an immediate-mode group: no fetch, no sharing. */
+static void dc_imm_build(const rsx_vertex_layout_plan* layout)
+{
+    dc.fetch_ok = 0;
+    if (!dc_reserve_verts((u64)dc.n_imm * layout->stride)) return;
+    for (u32 v = 0; v < dc.n_imm; v++)
+        for (u32 slot = 0; slot < layout->count; slot++) {
+            const u32 attr = layout->attrs[slot];
+            float* value = (float*)(dc.verts + (u64)v * layout->stride + slot * 16u);
+            memcpy(value, dc.imm[v][attr], 16);
+            /* the same never-set diffuse rule as rsx_vertex_fetch_plan_init */
+            if (attr == 3 && value[0] == 0.0f && value[1] == 0.0f && value[2] == 0.0f && value[3] == 1.0f)
+                value[0] = value[1] = value[2] = 1.0f;
+        }
+    dc.layout = *layout;
+    dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_imm;
+    dc.refs_remapped = 0;
+    dc.n_cuts = 0;
+    dc.fetch_ok = 1;
 }
 
 static int dc_push_ref(u32 vertex_id, u32 base_index)
@@ -1350,10 +1411,21 @@ static u32 sink_bind_vertex_textures(
     return bound;
 }
 
+/* Root diagnostic (2026-11-12): RSX_ENGINE_TRACE=1 in the environment prints why a draw was dropped, or
+ * what was handed to the backend. Host tools only; getenv is read once. */
+static int eng_trace(void)
+{
+    static int state = -1;
+    if (state < 0) state = getenv("RSX_ENGINE_TRACE") != NULL;
+    return state;
+}
+#define ENG_DROP(why) do { if (eng_trace()) fprintf(stderr, "[rsx engine] draw dropped: %s (prim %u)\n", why, g.rsx.current_primitive); return; } while (0)
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    if (!g.ready || !dc.n_packets) return;
+    const int immediate = !dc.n_packets && dc.n_imm;
+    if (!g.ready || (!dc.n_packets && !immediate)) { if (eng_trace()) fprintf(stderr, "[rsx engine] end without packets (ready %d)\n", (int)g.ready); return; }
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -1368,33 +1440,34 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
-        if (rsx_primitive_needs_expansion(prim)) return;
+        if (rsx_primitive_needs_expansion(prim)) ENG_DROP("primitive needs expansion");
         topology = rsx_primitive_topology(prim);
-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) ENG_DROP("unsupported topology");
     }
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
-    dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (immediate) dc_imm_build(&layout);
+    else dc_fetch(&layout, rebuild);
+    if (!dc.n_verts || !dc.fetch_ok) ENG_DROP(dc.n_verts ? "vertex fetch failed" : "no vertices");
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) ENG_DROP("topology rebuild");
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
-    if (!n_draw) return;
+    if (!n_draw) ENG_DROP("zero indices");
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets) ENG_DROP("no colour target");
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
@@ -1427,7 +1500,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs,
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed);
-    if (!pipeline) return;
+    if (!pipeline) ENG_DROP("no pipeline");
 
     if (indexed) {
         if (!dc_reserve_indices(n_draw)) return;
@@ -1519,6 +1592,24 @@ static void sink_end(void* user, const rsx_dispatch* r)
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
+    if (eng_trace()) {
+        const float* v0 = (const float*)dc.verts;
+        fprintf(stderr, "[rsx engine] draw prim %u: %u verts stride %u, %u indices, pipeline %u fixed %d, target %u depth %u, tex mask 0x%X, "
+                "xf %.4g %.4g %.4g | %.4g %.4g %.4g, surface %ux%u, first floats %.4g %.4g %.4g %.4g\n",
+                prim, uploaded, layout.stride, indexed ? n_draw : 0u, pipeline, pipeline_is_fixed, handles[0], depth_handle, tex_mask,
+                xf[0], xf[1], xf[2], xf[4], xf[5], xf[6], (unsigned)W, (unsigned)H, v0[0], v0[1], v0[2], v0[3]);
+        /* Root (2026-11-13): the bound handles, so a replay can tell which pass reads which target. */
+        { u32 t;
+          fprintf(stderr, "[rsx engine]   targets");
+          for (t = 0; t < n_targets; t++) fprintf(stderr, " %u", handles[t]);
+          fprintf(stderr, " | textures");
+          for (t = 0; t < RSX_BE_MAX_TEXTURES; t++) if ((tex_mask >> t) & 1u) fprintf(stderr, " %u:%u", t, textures[t]);
+          fprintf(stderr, "\n"); }
+        { const float* c = (const float*)g.fp_cb;
+          fprintf(stderr, "[rsx engine]   fp constants %u first %.4g %.4g %.4g %.4g | blend %u sf 0x%X df 0x%X | depth test %u write %u func 0x%X | cull %u face 0x%X front 0x%X | mask 0x%X | alpha test %u | stencil %u\n",
+                  g.fp_constants.count, c[0], c[1], c[2], c[3], rs.blend_enable, rs.sf_rgb, rs.df_rgb, rs.depth_test, rs.depth_write, rs.depth_func,
+                  rs.cull_enable, rs.cull_face, rs.front_face, rs.color_mask, rs.alpha_test_enable, rs.stencil_enable); }
+    }
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
     /* Counted only when the draw ran the guest's OWN programs, which is what
@@ -1717,6 +1808,7 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
     rsx_dispatch_method(&g.rsx, m, arg);
+    if (g.rsx.in_begin_end && eng_imm_provokes(m)) dc_imm_push();
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

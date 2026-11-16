@@ -56,6 +56,36 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
  * are unaffected (W is identity modulo the within-word reversal). */
 #define SPU_W(P) (((P) & ~3) | (3 - ((P) & 3)))
 
+/* ---- AArch64 NEON layer (SPU__NEON, defined in spu_context.h) ------------------------------------------------
+ * Our u128 is host-native little-endian: _u32[i] is SPU word i as a value, so a NEON q register loaded from the
+ * union has lane i == _u32[i] (exactly like the SSE paths below, whose semantics every NEON body mirrors). All
+ * conversions go through memcpy (alias-safe, folds to a register move or a plain ldr/str). The NEON bodies keep
+ * the helper names and signatures; the previous scalar body of each is kept as spu_<op>_ref at the end of this
+ * header (all builds) -- native/spu_neon/spu_neon_selftest.c compares every NEON body against it. */
+#if SPU__NEON
+#define SPU__NINL static inline __attribute__((always_inline))
+SPU__NINL uint32x4_t spu__nl(u128 a)      { uint32x4_t v; memcpy(&v, &a, 16); return v; }
+SPU__NINL u128       spu__ns(uint32x4_t v) { u128 r; memcpy((void*)&r, &v, 16); return r; }   /* (void*): C++ -Wclass-memaccess */
+SPU__NINL uint8x16_t spu__nl8(u128 a)     { return vreinterpretq_u8_u32(spu__nl(a)); }
+SPU__NINL uint16x8_t spu__nl16(u128 a)    { return vreinterpretq_u16_u32(spu__nl(a)); }
+SPU__NINL int8x16_t  spu__nls8(u128 a)    { return vreinterpretq_s8_u32(spu__nl(a)); }
+SPU__NINL int16x8_t  spu__nls16(u128 a)   { return vreinterpretq_s16_u32(spu__nl(a)); }
+SPU__NINL int32x4_t  spu__nls32(u128 a)   { return vreinterpretq_s32_u32(spu__nl(a)); }
+SPU__NINL u128 spu__ns8(uint8x16_t v)     { return spu__ns(vreinterpretq_u32_u8(v)); }
+SPU__NINL u128 spu__ns16(uint16x8_t v)    { return spu__ns(vreinterpretq_u32_u16(v)); }
+SPU__NINL u128 spu__nss16(int16x8_t v)    { return spu__ns(vreinterpretq_u32_s16(v)); }
+SPU__NINL u128 spu__nss32(int32x4_t v)    { return spu__ns(vreinterpretq_u32_s32(v)); }
+/* single-precision NEON (spu_fa & co): native executor only, where the extended-range clamp is compile-time
+ * policy (the SPU__NEONF switch); -DSPU_NEON_SCALAR_FLOAT keeps the scalar float ops on AArch64. */
+#if defined(PS3_NATIVE_SPU_EXECUTOR) && !defined(SPU_NEON_SCALAR_FLOAT)
+#define SPU__NEONF 1
+#else
+#define SPU__NEONF 0
+#endif
+#else
+#define SPU__NEONF 0
+#endif
+
 
 /* v30b (FPS): byte-permute helpers as ONE pshufb with a precomputed control.
  * The scalar versions (kept as *_ref, used when SSSE3 is unavailable and by the
@@ -64,8 +94,10 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
  * lifted job modules' quadword ops (every unaligned scalar load), and cwd/cbd
  * (every scalar store) rebuilt a 16-byte control in a loop. Bit-exact vs the
  * reference for every shift / position (exhaustive test). */
-#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__)
+#if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__) || SPU__NEON
+#if !SPU__NEON
 #include <tmmintrin.h>
+#endif
 #define SPU__SIMD 1
 #if defined(_MSC_VER) && !defined(__clang__)
 #define SPU__ALIGN16 __declspec(align(16))
@@ -198,20 +230,32 @@ static const SPU__ALIGN16 uint8_t spu__t_cdd[16][16] = {
     {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04},
     {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04},
 };
+#if SPU__NEON
+/* One tbl: ctl bytes 0..15 index a's host bytes, 0x80 (any index >= 16) gives 0 -- the same table semantics as
+ * pshufb for the 0x00..0x0F / 0x80 entries the tables above hold. */
+SPU__NINL u128 spu__pshufb(u128 a, const uint8_t* ctl) {
+    return spu__ns8(vqtbl1q_u8(spu__nl8(a), vld1q_u8(ctl)));
+}
+#else
 static inline u128 spu__pshufb(u128 a, const uint8_t* ctl) {
     __m128i A; memcpy(&A, &a, 16);
     __m128i r = _mm_shuffle_epi8(A, _mm_load_si128((const __m128i*)ctl));
     u128 o; memcpy(&o, &r, 16); return o;
 }
+#endif
 static inline u128 spu__ldtbl(const uint8_t* t) { u128 o; memcpy(&o, t, 16); return o; }
 #else
 #define SPU__SIMD 0
 #endif
 
 /* ---- constructors ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_splat_u32(uint32_t v) { return spu__ns(vdupq_n_u32(v)); }
+#else
 static inline u128 spu_splat_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=v; r._u32[2]=v; r._u32[3]=v; return r;
 }
+#endif
 /* Link register value for brsl/bisl/bisled: the SPU writes the return address
  * into the PREFERRED word (word 0) and ZEROS the other three slots (matches
  * RPCS3 v128::from32r, SPUInterpreter.cpp BRSL). Splatting it (the old bug)
@@ -233,44 +277,108 @@ static inline void spu_unsupported(uint32_t pc, const char* mnemonic)
     }
 }
 
+#if SPU__NEON
+SPU__NINL u128 spu_link(uint32_t addr) { return spu__ns(vsetq_lane_u32(addr, vdupq_n_u32(0), 0)); }
+#else
 static inline u128 spu_link(uint32_t addr) {
     u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
+#endif
 /* Preferred-slot scalar: value in word 0, remaining slots ZERO. CBEA's scalar
  * channel convention -- rchcnt returns the count this way (RPCS3 measured
  * {1,0,0,0} where the old splat gave {1,1,1,1}). Same bug class as spu_link. */
+#if SPU__NEON
+SPU__NINL u128 spu_pref_u32(uint32_t v) { return spu__ns(vsetq_lane_u32(v, vdupq_n_u32(0), 0)); }
+#else
 static inline u128 spu_pref_u32(uint32_t v) {
     u128 r; r._u32[0]=v; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
 }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_splat_u16(uint16_t v) { return spu__ns16(vdupq_n_u16(v)); }
+#else
 static inline u128 spu_splat_u16(uint16_t v) {
     u128 r; for (int i=0;i<8;i++) r._u16[i]=v; return r;
 }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_splat_u8(uint8_t v) { return spu__ns8(vdupq_n_u8(v)); }
+#else
 static inline u128 spu_splat_u8(uint8_t v) {
     u128 r; for (int i=0;i<16;i++) r._u8[i]=v; return r;
 }
+#endif
 static inline u128 spu_zero(void) { u128 r; memset(&r,0,sizeof r); return r; }
 
 /* ---- integer arithmetic (SIMD) ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_a(u128 a, u128 b) { return spu__ns(vaddq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_a(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_sf(u128 a, u128 b) { return spu__ns(vsubq_u32(spu__nl(b), spu__nl(a))); }
+#else
 static inline u128 spu_sf(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]-a._u32[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ah(u128 a, u128 b) { return spu__ns16(vaddq_u16(spu__nl16(a), spu__nl16(b))); }
+#else
 static inline u128 spu_ah(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+b._u16[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_sfh(u128 a, u128 b) { return spu__ns16(vsubq_u16(spu__nl16(b), spu__nl16(a))); }
+#else
 static inline u128 spu_sfh(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=b._u16[i]-a._u16[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ai(u128 a, int32_t imm) { return spu__ns(vaddq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_ai(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+(uint32_t)imm; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ahi(u128 a, int32_t imm) { return spu__ns16(vaddq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_ahi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+(uint16_t)imm; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_sfi(u128 a, int32_t imm) { return spu__ns(vsubq_u32(vdupq_n_u32((uint32_t)imm), spu__nl(a))); }
+#else
 static inline u128 spu_sfi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)imm-a._u32[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_sfhi(u128 a, int32_t imm) { return spu__ns16(vsubq_u16(vdupq_n_u16((uint16_t)imm), spu__nl16(a))); }
+#else
 static inline u128 spu_sfhi(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
+#endif
 
 /* ---- multiply (low halfword of each word × ... -> 32-bit, per SPU mpy) ----
  * Sub-lane indexing assumes a little-endian host (matches the recompiler's
  * target). The "low halfword of word i" in SPU BE semantics is _s16[2i] on
  * an LE host (NOT _s16[2i+1], which would be correct on a BE host). */
+#if SPU__NEON
+SPU__NINL u128 spu_mpy(u128 a, u128 b) { return spu__nss32(vmull_s16(vmovn_s32(spu__nls32(a)), vmovn_s32(spu__nls32(b)))); }
+#else
 static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]; return r; }
+#endif
 /* mpya: 16x16 signed multiply of low halves + add rc (per word, RRR form). */
+#if SPU__NEON
+SPU__NINL u128 spu_mpya(u128 a, u128 b, u128 c) { return spu__nss32(vmlal_s16(spu__nls32(c), vmovn_s32(spu__nls32(a)), vmovn_s32(spu__nls32(b)))); }
+#else
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
+#endif
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
+#if SPU__NEON
+SPU__NINL u128 spu_sfx(u128 a, u128 b, u128 t) { return spu__ns(vaddq_u32(vaddq_u32(spu__nl(b), vmvnq_u32(spu__nl(a))), vandq_u32(spu__nl(t), vdupq_n_u32(1)))); }
+#else
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
+#endif
 /* FI decodes the base and step fields produced by the hardware estimate
  * instructions; its second operand is not an ordinary reciprocal float. */
+/* Root (2026-11-15, Decision 124, console profile rv63s): ldexpf + scalbnf (libm, two calls per lane) were 2.3 % of every SPURS job
+ * thread on the console, where the x86 v130 vector form is not built. For exp >= 14 both scalings are by a NORMAL power of two
+ * (2^(exp-140) >= 2^-126) of an integer below 2^19, so a multiply by that power, built from its bits, is exact and gives the same
+ * float as ldexpf under every rounding and flush mode; smaller exponents keep the ldexpf path. -DSPU_FI_LDEXPF restores the old code. */
 static inline u128 spu_fi(u128 a, u128 b) {
     u128 r;
     for (int i = 0; i < 4; i++) {
@@ -280,6 +388,17 @@ static inline u128 spu_fi(u128 a, u128 b) {
         uint32_t base_bits = rb & 0xFFFFFC00u;
         float base; memcpy(&base, &base_bits, sizeof base);
         uint32_t step_frac = rb & 0x3FFu;
+#ifndef SPU_FI_LDEXPF
+        if (__builtin_expect(exp >= 14u, 1)) {
+            const uint32_t p2_bits = (exp - 13u) << 23;
+            float p2; memcpy(&p2, &p2_bits, sizeof p2);
+            float step = (float)step_frac * p2;
+            if (base < 0.0f) step = -step;
+            const float y = (float)(ra & 0x7FFFFu) * (1.0f / 524288.0f);
+            r._f32[i] = base - step * y;
+            continue;
+        }
+#endif
         float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
         if (base < 0.0f) step = -step;
         float y = ldexpf((float)(ra & 0x7FFFFu), -19);
@@ -287,25 +406,79 @@ static inline u128 spu_fi(u128 a, u128 b) {
     }
     return r;
 }
+#if SPU__NEON
+SPU__NINL u128 spu_mpyu(u128 a, u128 b) { return spu__ns(vmull_u16(vmovn_u32(spu__nl(a)), vmovn_u32(spu__nl(b)))); }
+#else
 static inline u128 spu_mpyu(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_mpyi(u128 a, int32_t imm) { return spu__nss32(vmull_s16(vmovn_s32(spu__nls32(a)), vdup_n_s16((int16_t)imm))); }
+#else
 static inline u128 spu_mpyi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
+#endif
 
 /* ---- bitwise logic (whole 128 bits) ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_and(u128 a, u128 b) { return spu__ns(vandq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_and(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]&b._u64[0]; r._u64[1]=a._u64[1]&b._u64[1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_or(u128 a, u128 b) { return spu__ns(vorrq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_or(u128 a, u128 b)  { u128 r; r._u64[0]=a._u64[0]|b._u64[0]; r._u64[1]=a._u64[1]|b._u64[1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_xor(u128 a, u128 b) { return spu__ns(veorq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_xor(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]^b._u64[0]; r._u64[1]=a._u64[1]^b._u64[1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_nand(u128 a, u128 b) { return spu__ns(vmvnq_u32(vandq_u32(spu__nl(a), spu__nl(b)))); }
+#else
 static inline u128 spu_nand(u128 a, u128 b){ u128 r; r._u64[0]=~(a._u64[0]&b._u64[0]); r._u64[1]=~(a._u64[1]&b._u64[1]); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_nor(u128 a, u128 b) { return spu__ns(vmvnq_u32(vorrq_u32(spu__nl(a), spu__nl(b)))); }
+#else
 static inline u128 spu_nor(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]|b._u64[0]); r._u64[1]=~(a._u64[1]|b._u64[1]); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_andc(u128 a, u128 b) { return spu__ns(vbicq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_andc(u128 a, u128 b){ u128 r; r._u64[0]=a._u64[0]&~b._u64[0]; r._u64[1]=a._u64[1]&~b._u64[1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_orc(u128 a, u128 b) { return spu__ns(vornq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_orc(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]|~b._u64[0]; r._u64[1]=a._u64[1]|~b._u64[1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_andi(u128 a, int32_t imm) { return spu__ns(vandq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_andi(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]&(uint32_t)imm; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ori(u128 a, int32_t imm) { return spu__ns(vorrq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_ori(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_xori(u128 a, int32_t imm) { return spu__ns(veorq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_xori(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]^(uint32_t)imm; return r; }
+#endif
 
 /* ---- count leading zeros / population count per byte ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_clz(u128 a) { return spu__ns(vclzq_u32(spu__nl(a))); }
+#else
 static inline u128 spu_clz(u128 a)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)spu_clz32(a._u32[i]); return r; }
+#endif
 static inline u128 spu_cntb_ref(u128 a) { u128 r; for(int i=0;i<16;i++){ uint8_t v=a._u8[i],c=0; while(v){c+=v&1;v>>=1;} r._u8[i]=c; } return r; }
-#if SPU__SIMD
+#if SPU__NEON
+SPU__NINL u128 spu_cntb(u128 a){ return spu__ns8(vcntq_u8(spu__nl8(a))); }
+#elif SPU__SIMD
 static inline u128 spu_cntb(u128 a){ __m128i A; memcpy(&A,&a,16);
     const __m128i lut=_mm_setr_epi8(0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4), m=_mm_set1_epi8(0x0F);
     __m128i r=_mm_add_epi8(_mm_shuffle_epi8(lut,_mm_and_si128(A,m)), _mm_shuffle_epi8(lut,_mm_and_si128(_mm_srli_epi16(A,4),m)));
@@ -315,26 +488,78 @@ static inline u128 spu_cntb(u128 a){ __m128i A; memcpy(&A,&a,16);
 #endif
 
 /* ---- compares: all-ones / all-zeros per lane ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_ceq(u128 a, u128 b) { return spu__ns(vceqq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_ceq(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]==b._u32[i])?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ceqh(u128 a, u128 b) { return spu__ns16(vceqq_u16(spu__nl16(a), spu__nl16(b))); }
+#else
 static inline u128 spu_ceqh(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]==b._u16[i])?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ceqb(u128 a, u128 b) { return spu__ns8(vceqq_u8(spu__nl8(a), spu__nl8(b))); }
+#else
 static inline u128 spu_ceqb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==b._u8[i])?0xFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgt(u128 a, u128 b) { return spu__ns(vcgtq_s32(spu__nls32(a), spu__nls32(b))); }
+#else
 static inline u128 spu_cgt(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>b._s32[i])?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgth(u128 a, u128 b) { return spu__ns16(vcgtq_s16(spu__nls16(a), spu__nls16(b))); }
+#else
 static inline u128 spu_cgth(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>b._s16[i])?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgtb(u128 a, u128 b) { return spu__ns8(vcgtq_s8(spu__nls8(a), spu__nls8(b))); }
+#else
 static inline u128 spu_cgtb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>b._s8[i])?0xFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgt(u128 a, u128 b) { return spu__ns(vcgtq_u32(spu__nl(a), spu__nl(b))); }
+#else
 static inline u128 spu_clgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>b._u32[i])?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgth(u128 a, u128 b) { return spu__ns16(vcgtq_u16(spu__nl16(a), spu__nl16(b))); }
+#else
 static inline u128 spu_clgth(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>b._u16[i])?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgtb(u128 a, u128 b) { return spu__ns8(vcgtq_u8(spu__nl8(a), spu__nl8(b))); }
+#else
 static inline u128 spu_clgtb(u128 a, u128 b){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>b._u8[i])?0xFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ceqi(u128 a, int32_t imm) { return spu__ns(vceqq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_ceqi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]==imm)?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgti(u128 a, int32_t imm) { return spu__ns(vcgtq_s32(spu__nls32(a), vdupq_n_s32(imm))); }
+#else
 static inline u128 spu_cgti(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>imm)?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgti(u128 a, int32_t imm) { return spu__ns(vcgtq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_clgti(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>(uint32_t)imm)?0xFFFFFFFFu:0; return r; }
+#endif
 
 /* ---- select / shuffle ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_selb(u128 a, u128 b, u128 c) { return spu__ns(vbslq_u32(spu__nl(c), spu__nl(b), spu__nl(a))); }
+#else
 static inline u128 spu_selb(u128 a, u128 b, u128 c) {
     u128 r;
     r._u64[0]=(a._u64[0]&~c._u64[0])|(b._u64[0]&c._u64[0]);
     r._u64[1]=(a._u64[1]&~c._u64[1])|(b._u64[1]&c._u64[1]);
     return r;
 }
+#endif
 /* shufb special selectors per Cell BE ISA:
  *   sel & 0xE0 == 0xE0 -> 0x80
  *   sel & 0xC0 == 0xC0 -> 0xFF
@@ -384,6 +609,44 @@ static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
     }
     return r;
 }
+#elif SPU__NEON
+/* AArch64 shufb: ONE tbl over the 32-byte {a,b} table + one tbl for the special selectors, no byte swaps.
+ * Same derivation as the SSE4.1 path above: SPU byte P of a register is host byte P^3, and the result host byte h
+ * is decided by control host byte h (the swaps into SPU order and back cancel), so the index is c^3.
+ * Selector classes (SPU ISA): bit 7 clear -> concat{a,b}[sel & 0x1F] (bits 5/6 are ignored, so mask them off with
+ * 0x9F); 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. A selector with bit 7 set keeps bit 7 in the index, which is >= 32
+ * and makes tbl2 return 0; the top-nibble LUT then ORs in 0x00 / 0xFF / 0x80. tests: native/spu_neon selftest
+ * (every selector byte value) against spu_shufb_ref. */
+SPU__NINL u128 spu_shufb(u128 a, u128 b, u128 c) {
+    static const uint8_t lut_b[16] = {0,0,0,0, 0,0,0,0, 0,0,0,0, 0xFF,0xFF,0x80,0x80};
+    const uint8x16_t C = spu__nl8(c);
+    uint8x16x2_t t; t.val[0] = spu__nl8(a); t.val[1] = spu__nl8(b);
+    const uint8x16_t idx = vandq_u8(veorq_u8(C, vdupq_n_u8(3)), vdupq_n_u8(0x9F));
+    const uint8x16_t r = vorrq_u8(vqtbl2q_u8(t, idx), vqtbl1q_u8(vld1q_u8(lut_b), vshrq_n_u8(C, 4)));
+    return spu__ns8(r);
+}
+static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+     * control, and the result) through SPU_W so a control supplied as an immediate
+     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+     * SPU-byte-order selectors to match. */
+    uint8_t cat[32];
+    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+    u128 r;
+    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+        uint8_t v;
+        if      ((s & 0xE0)==0xE0) v=0x80;
+        else if ((s & 0xC0)==0xC0) v=0xFF;
+        else if ((s & 0xC0)==0x80) v=0x00;
+        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+        r._u8[SPU_W(t)] = v;
+    }
+    return r;
+}
 #else
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
@@ -411,13 +674,47 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 #endif
 
 /* ---- shift / rotate immediate (word lanes) ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_shli(u128 a, int sh) { return spu__ns(vshlq_u32(spu__nl(a), vdupq_n_s32(sh & 0x3F))); }
+#else
 static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_shlhi(u128 a, int sh) { return spu__ns16(vshlq_u16(spu__nl16(a), vdupq_n_s16((int16_t)(sh & 0x1F)))); }
+#else
 static inline u128 spu_shlhi(u128 a, int sh) { u128 r; sh&=0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_roti(u128 a, int sh) {
+    const uint32x4_t x = spu__nl(a); sh &= 31;
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(sh)), vshlq_u32(x, vdupq_n_s32(sh - 32))));
+}
+#else
 static inline u128 spu_roti(u128 a, int sh)  { u128 r; sh&=31; for(int i=0;i<4;i++) r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rothi(u128 a, int sh) {
+    const uint16x8_t x = spu__nl16(a); sh &= 15;
+    return spu__ns16(vorrq_u16(vshlq_u16(x, vdupq_n_s16((int16_t)sh)), vshlq_u16(x, vdupq_n_s16((int16_t)(sh - 16)))));
+}
+#else
 static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotmi(u128 a, int i7) { return spu__ns(vshlq_u32(spu__nl(a), vdupq_n_s32(-((0 - i7) & 0x3F)))); }
+#else
 static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotmai(u128 a, int i7) { return spu__nss32(vshlq_s32(spu__nls32(a), vdupq_n_s32(-((0 - i7) & 0x3F)))); }
+#else
 static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotmhi(u128 a, int i7) { return spu__ns16(vshlq_u16(spu__nl16(a), vdupq_n_s16((int16_t)-((0 - i7) & 0x1F)))); }
+#else
 static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+#endif
 static inline u128 spu_shlqbyi_ref(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 #if SPU__SIMD
 static inline u128 spu_shlqbyi(u128 a, int sh){ sh&=0x1F; return sh>=16 ? spu_zero() : spu__pshufb(a, spu__t_shl[sh]); }
@@ -435,14 +732,28 @@ static inline u128 spu_rotqbyi(u128 a, int sh){ return spu__pshufb(a, spu__t_rot
  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
  * corrupt any bits crossing a 32-bit boundary. Assemble the logical hi/lo halves
  * with _u32[0] as most-significant, shift, then disassemble. */
+#if SPU__NEON
+SPU__NINL u128 spu_shlqbii(u128 a, int sh_) {
+    const uint32x4_t x = spu__nl(a); const int sh = sh_ & 7;
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(sh)), vshlq_u32(vextq_u32(x, vdupq_n_u32(0), 1), vdupq_n_s32(sh - 32))));
+}
+#else
 static inline u128 spu_shlqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotqbii(u128 a, int sh_) {
+    const uint32x4_t x = spu__nl(a); const int sh = sh_ & 7;
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(sh)), vshlq_u32(vextq_u32(x, x, 1), vdupq_n_s32(sh - 32))));
+}
+#else
 static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
 
 /* ---- single-precision float (4 lanes) ----
  * v52 SPU_XFLOAT (approximate extended range, RPCS3's default "approximate xfloat"):
@@ -452,13 +763,29 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
  * character vertices, missing limb segments). Operands with exponent 255 are clamped to
  * +-FLT_MAX before every float op, so 0 * max = 0 as on the SPU. g_spu_xfloat=0 (env
  * SPU_XFLOAT=0) restores raw x86 semantics. */
+#if defined(PS3_NATIVE_SPU_EXECUTOR)
+/* Native: the clamp is compile-time policy, always on (the desktop default; SPU_XFLOAT=0 breaks the game). There is
+ * no process-global switch natively: g_spu_xfloat and g_spu_xflim are not declared and are poisoned, so a native TU
+ * naming either fails to compile, and the desktop runtime-limit form is refused. Clamp math is unchanged. */
+#if defined(SPU_XFLOAT_RUNTIME)
+#error "SPU_XFLOAT_RUNTIME (runtime float-policy limits) is desktop-only; the native xfloat clamp is compile-time policy"
+#endif
+#pragma GCC poison g_spu_xfloat g_spu_xflim
+#else
 extern int g_spu_xfloat;
+#endif
 static inline float spu_xf(float x) {
     uint32_t u; memcpy(&u, &x, 4);
     if ((u & 0x7F800000u) == 0x7F800000u) { u = (u & 0x80000000u) | 0x7F7FFFFFu; memcpy(&x, &u, 4); }
     return x;
 }
+#if defined(PS3_NATIVE_SPU_EXECUTOR)
+/* spu_xf's exact bit operation on the lane bits (no float round trip, which GCC -O2 misreports as an uninitialized
+ * read on the scalar AArch64 branch): exponent-255 lanes -> sign|0x7F7FFFFF, all other lanes bit-identical. */
+static inline u128 spu_xfv(u128 a) { for (int i = 0; i < 4; i++) if ((a._u32[i] & 0x7F800000u) == 0x7F800000u) a._u32[i] = (a._u32[i] & 0x80000000u) | 0x7F7FFFFFu; return a; }
+#else
 static inline u128 spu_xfv(u128 a) { if (g_spu_xfloat) for (int i = 0; i < 4; i++) a._f32[i] = spu_xf(a._f32[i]); return a; }
+#endif
 /* v63 (FPS): the single-precision ops as ONE packed SSE op each instead of a 4-lane scalar
  * loop (+ a branchy per-lane xfloat clamp). Bit-identical: same IEEE ops, same MXCSR, the
  * xfloat clamp is the same mask/blend; fma/fms/fnms use vfmadd/vfmsub/vfnmadd (single
@@ -482,7 +809,9 @@ static inline u128 spu__fst(__m128 v) { u128 r; memcpy(&r, &v, 16); return r; }
  * 0xFF7FFFFF (unsigned min), everything else unchanged == the blend version bit for bit (exhaustively
  * tested over all 2^32 patterns). g_spu_xflim = {0xFF7FFFFF x4, 0x7F7FFFFF x4}, or all-pass limits
  * {0xFFFFFFFF x4, 0x7FFFFFFF x4} when SPU_XFLOAT=0 (spu_interp.c keeps it in sync with g_spu_xfloat). */
+#if !defined(PS3_NATIVE_SPU_EXECUTOR)
 extern uint32_t g_spu_xflim[8];
+#endif
 #if defined(SPU_XFLOAT_RUNTIME)
 static inline __m128 spu__xfq(__m128 v)
 {
@@ -508,7 +837,9 @@ static inline __m128 spu__xfq(__m128 v)
 #else
 static inline __m128 spu__xfq(__m128 v)
 {
+#if !defined(PS3_NATIVE_SPU_EXECUTOR)
     if (!g_spu_xfloat) return v;
+#endif
     const __m128i e = _mm_set1_epi32(0x7F800000);
     __m128i i = _mm_castps_si128(v);
     __m128i m = _mm_cmpeq_epi32(_mm_and_si128(i, e), e);
@@ -531,10 +862,33 @@ static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; a=spu__fst(spu__xf
 #else
 #define SPU__FSIMD 0
 #endif
-#if !SPU__FSIMD
+
+#if SPU__NEONF
+/* AArch64 single precision, native executor: the extended-range clamp of spu_xfv as two integer mins per
+ * register (positive 0x7F800000..0x7FFFFFFF -> 0x7F7FFFFF by a signed min, negative 0xFF800000..0xFFFFFFFF ->
+ * 0xFF7FFFFF by an unsigned min, everything else unchanged -- the same identity the SSE4.1 spu__xfq uses and
+ * test_spu_float_policy.c proves over all 2^32 patterns), then ONE packed NEON op with the same IEEE semantics as
+ * the scalar loop it replaces. AArch64 NEON FP follows FPCR exactly like the scalar unit (rounding mode,
+ * flush-to-zero), so the SPU truncate+FTZ mode set through spu_fp_control applies to both alike. fma/fms/fnms
+ * are single-rounding (fmla / fmls) like fmaf. */
+SPU__NINL float32x4_t spu__nlx(u128 a) {
+    uint32x4_t x = vminq_u32(spu__nl(a), vdupq_n_u32(0xFF7FFFFFu));
+    x = vreinterpretq_u32_s32(vminq_s32(vreinterpretq_s32_u32(x), vdupq_n_s32(0x7F7FFFFF)));
+    return vreinterpretq_f32_u32(x);
+}
+SPU__NINL u128 spu__nsf(float32x4_t v) { return spu__ns(vreinterpretq_u32_f32(v)); }
+SPU__NINL u128 spu_fa(u128 a, u128 b)  { return spu__nsf(vaddq_f32(spu__nlx(a), spu__nlx(b))); }
+SPU__NINL u128 spu_fs(u128 a, u128 b)  { return spu__nsf(vsubq_f32(spu__nlx(a), spu__nlx(b))); }
+SPU__NINL u128 spu_fm(u128 a, u128 b)  { return spu__nsf(vmulq_f32(spu__nlx(a), spu__nlx(b))); }
+/* a*b + c, a*b - c, c - a*b */
+SPU__NINL u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__nsf(vfmaq_f32(spu__nlx(c), spu__nlx(a), spu__nlx(b))); }
+SPU__NINL u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__nsf(vfmaq_f32(vnegq_f32(spu__nlx(c)), spu__nlx(a), spu__nlx(b))); }
+SPU__NINL u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__nsf(vfmsq_f32(spu__nlx(c), spu__nlx(a), spu__nlx(b))); }
+#endif
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
 #endif
-#if !SPU__FSIMD
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fs(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
 #endif
 
@@ -542,6 +896,36 @@ static inline u128 spu_fs(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); 
 static inline double spu__p2(int e) { uint64_t u = (uint64_t)(1023 + e) << 52; double d; memcpy(&d, &u, 8); return d; }
 /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
  * The canonical immediates 173 and 155 are identity conversions. */
+#if SPU__NEONF
+/* Root (2026-11-15, Decision 126): the four RI8 conversions as NEON, the same IEEE operations as the scalar bodies below, two lanes per
+ * double register: widen (exact), multiply by the power of two, clamp (FMAX/FMIN propagate a NaN, which then converts to 0 exactly as the
+ * scalar (int32_t)/(uint32_t) casts do on AArch64), convert with truncation, narrow (the clamped values fit). Int-to-float: one rounding of
+ * the exact double product to single (FCVTN, FPCR mode), as the scalar (float) cast. The selftest compares them with spu_c*_ref. */
+SPU__NINL u128 spu_cflts(u128 a, int i8) {
+    const float32x4_t x = spu__nlx(a); const float64x2_t f = vdupq_n_f64(spu__p2(173 - i8));
+    const float64x2_t hi = vdupq_n_f64(2147483647.0), lo = vdupq_n_f64(-2147483648.0);
+    const float64x2_t d0 = vminq_f64(vmaxq_f64(vmulq_f64(vcvt_f64_f32(vget_low_f32(x)), f), lo), hi);
+    const float64x2_t d1 = vminq_f64(vmaxq_f64(vmulq_f64(vcvt_high_f64_f32(x), f), lo), hi);
+    return spu__nss32(vcombine_s32(vmovn_s64(vcvtq_s64_f64(d0)), vmovn_s64(vcvtq_s64_f64(d1))));
+}
+SPU__NINL u128 spu_cfltu(u128 a, int i8) {
+    const float32x4_t x = spu__nlx(a); const float64x2_t f = vdupq_n_f64(spu__p2(173 - i8));
+    const float64x2_t hi = vdupq_n_f64(4294967295.0), lo = vdupq_n_f64(0.0);
+    const float64x2_t d0 = vminq_f64(vmaxq_f64(vmulq_f64(vcvt_f64_f32(vget_low_f32(x)), f), lo), hi);
+    const float64x2_t d1 = vminq_f64(vmaxq_f64(vmulq_f64(vcvt_high_f64_f32(x), f), lo), hi);
+    return spu__ns(vcombine_u32(vmovn_u64(vcvtq_u64_f64(d0)), vmovn_u64(vcvtq_u64_f64(d1))));
+}
+SPU__NINL u128 spu_csflt(u128 a, int i8) {
+    const int32x4_t v = vreinterpretq_s32_u32(spu__nl(a)); const float64x2_t f = vdupq_n_f64(spu__p2(i8 - 155));
+    const float64x2_t d0 = vmulq_f64(vcvtq_f64_s64(vmovl_s32(vget_low_s32(v))), f), d1 = vmulq_f64(vcvtq_f64_s64(vmovl_high_s32(v)), f);
+    return spu__ns(vreinterpretq_u32_f32(vcvt_high_f32_f64(vcvt_f32_f64(d0), d1)));
+}
+SPU__NINL u128 spu_cuflt(u128 a, int i8) {
+    const uint32x4_t v = spu__nl(a); const float64x2_t f = vdupq_n_f64(spu__p2(i8 - 155));
+    const float64x2_t d0 = vmulq_f64(vcvtq_f64_u64(vmovl_u32(vget_low_u32(v))), f), d1 = vmulq_f64(vcvtq_f64_u64(vmovl_high_u32(v)), f);
+    return spu__ns(vreinterpretq_u32_f32(vcvt_high_f32_f64(vcvt_f32_f64(d0), d1)));
+}
+#else
 static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=spu__p2(173-i8); a=spu_xfv(a);
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=spu__p2(173-i8); a=spu_xfv(a);
@@ -550,20 +934,29 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=spu__p2(i8-155);
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=spu__p2(i8-155);
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
-#if !SPU__FSIMD
+#endif
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
 #endif
-#if !SPU__FSIMD
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
 #endif
-#if !SPU__FSIMD
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
 #endif
-#if !SPU__FSIMD
+#if !SPU__FSIMD && !SPU__NEONF
 static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
 #endif
+#if SPU__NEONF
+SPU__NINL u128 spu_fceq(u128 a, u128 b)  { return spu__ns(vceqq_f32(spu__nlx(a), spu__nlx(b))); }
+#else
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+#endif
+#if SPU__NEONF
+SPU__NINL u128 spu_fcgt(u128 a, u128 b)  { return spu__ns(vcgtq_f32(spu__nlx(a), spu__nlx(b))); }
+#else
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+#endif
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
@@ -571,9 +964,15 @@ static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b)
 /* SPU DP is IEEE round-to-nearest with denormals; SPU SP runs with MXCSR =
  * truncate + FTZ/DAZ (SPU_FLOAT_MODE). Switch per DP op HERE so lifted code and
  * the interpreter agree (2026-10-04: lifted WWS jobs call these directly). */
+#if defined(PS3_SPU_EXTERNAL_FP_CONTROL)
+#include "spu_fp_control.h"
+#define SPU__DP_BEGIN { spu_fp_saved_state _spu_dpc = spu_fp_begin_double();
+#define SPU__DP_END   spu_fp_end_double(_spu_dpc); }
+#else
 #include <xmmintrin.h>
 #define SPU__DP_BEGIN { unsigned _spu_dpc = _mm_getcsr(); _mm_setcsr(_spu_dpc & ~0xE040u);
 #define SPU__DP_END   _mm_setcsr(_spu_dpc); }
+#endif
 static inline double spu__dget(u128 r, int i) {
     uint64_t u = ((uint64_t)r._u32[i*2] << 32) | r._u32[i*2+1];
     double d; memcpy(&d, &u, sizeof d); return d;
@@ -597,19 +996,54 @@ static inline u128 spu_dfcmeq(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ do
 static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2]); return r; }
 static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2]=(float)spu__dget(a,i); return r; }
 /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
+#if SPU__NEON
+SPU__NINL u128 spu_mpyhhu(u128 a, u128 b) { return spu__ns(vmull_u16(vshrn_n_u32(spu__nl(a), 16), vshrn_n_u32(spu__nl(b), 16))); }
+#else
 static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
+#endif
 /* cgx: extended carry-generate, carry-in = low bit of old rt (RPCS3 CGX). */
+#if SPU__NEON
+SPU__NINL u128 spu_cgx(u128 a, u128 b, u128 t) {
+    const uint32x4_t x = spu__nl(a), s = vaddq_u32(x, spu__nl(b)), s2 = vaddq_u32(s, vandq_u32(spu__nl(t), vdupq_n_u32(1)));
+    return spu__ns(vshrq_n_u32(vorrq_u32(vcltq_u32(s, x), vcltq_u32(s2, s)), 31));
+}
+#else
 static inline u128 spu_cgx(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)(t._u32[i]&1u)+a._u32[i]+b._u32[i])>>32); return r; }
+#endif
 
 /* ---- remaining SPU ISA ops (RPCS3 SPUInterpreter: EQV/ABSDB/AVGB/MPYHHA/
  * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_eqv(u128 a, u128 b) { return spu__ns(vmvnq_u32(veorq_u32(spu__nl(a), spu__nl(b)))); }
+#else
 static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_xorbi(u128 a, int32_t imm) { return spu__ns8(veorq_u8(spu__nl8(a), vdupq_n_u8((uint8_t)imm))); }
+#else
 static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_absdb(u128 a, u128 b) { return spu__ns8(vabdq_u8(spu__nl8(a), spu__nl8(b))); }
+#else
 static inline u128 spu_absdb(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_avgb(u128 a, u128 b) { return spu__ns8(vrhaddq_u8(spu__nl8(a), spu__nl8(b))); }
+#else
 static inline u128 spu_avgb(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
+#endif
 /* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
+#if SPU__NEON
+SPU__NINL u128 spu_mpyhha(u128 a, u128 b, u128 t) { return spu__nss32(vmlal_s16(spu__nls32(t), vshrn_n_s32(spu__nls32(a), 16), vshrn_n_s32(spu__nls32(b), 16))); }
+#else
 static inline u128 spu_mpyhha(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_mpyhhau(u128 a, u128 b, u128 t) { return spu__ns(vmlal_u16(spu__nl(t), vshrn_n_u32(spu__nl(a), 16), vshrn_n_u32(spu__nl(b), 16))); }
+#else
 static inline u128 spu_mpyhhau(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
+#endif
 /* double compare greater (RPCS3 stubs these; sane impl) -> per-lane mask. */
 static inline u128 spu_dfcgt(u128 a, u128 b)  { u128 r; for(int i=0;i<2;i++){ uint64_t m=(spu__dget(a,i)>spu__dget(b,i))?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
 static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ double x=spu__dget(a,i),y=spu__dget(b,i); if(x<0)x=-x; if(y<0)y=-y; uint64_t m=(x>y)?~0ull:0ull; r._u32[i*2]=(uint32_t)(m>>32); r._u32[i*2+1]=(uint32_t)m; } return r; }
@@ -617,18 +1051,54 @@ static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ do
 static inline u128 spu_dftsv(u128 a, int32_t imm){ u128 r; for(int i=0;i<2;i++){ uint64_t v=((uint64_t)a._u32[i*2]<<32)|a._u32[i*2+1]; int neg=(int)(v>>63); uint64_t e=(v>>52)&0x7FF, f=v&0xFFFFFFFFFFFFFull; int hit=0; if(e==0x7FF&&f) hit=(imm&0x40)!=0; else if(e==0x7FF) hit=(imm&(neg?0x10:0x20))!=0; else if(e==0&&!f) hit=(imm&(neg?0x04:0x08))!=0; else if(e==0) hit=(imm&(neg?0x01:0x02))!=0; uint32_t m=hit?~0u:0u; r._u32[i*2]=m; r._u32[i*2+1]=m; } return r; }
 
 /* ---- Phase 2: register-variable shifts/rotates ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_shl(u128 a, u128 b) { return spu__ns(vshlq_u32(spu__nl(a), vreinterpretq_s32_u32(vandq_u32(spu__nl(b), vdupq_n_u32(0x3F))))); }
+#else
 static inline u128 spu_shl(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_shlh(u128 a, u128 b) { return spu__ns16(vshlq_u16(spu__nl16(a), vreinterpretq_s16_u16(vandq_u16(spu__nl16(b), vdupq_n_u16(0x1F))))); }
+#else
 static inline u128 spu_shlh(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rot(u128 a, u128 b) {
+    const uint32x4_t x = spu__nl(a); const int32x4_t n = vreinterpretq_s32_u32(vandq_u32(spu__nl(b), vdupq_n_u32(31)));
+    return spu__ns(vorrq_u32(vshlq_u32(x, n), vshlq_u32(x, vsubq_s32(n, vdupq_n_s32(32)))));
+}
+#else
 static inline u128 spu_rot(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_roth(u128 a, u128 b) {
+    const uint16x8_t x = spu__nl16(a); const int16x8_t n = vreinterpretq_s16_u16(vandq_u16(spu__nl16(b), vdupq_n_u16(15)));
+    return spu__ns16(vorrq_u16(vshlq_u16(x, n), vshlq_u16(x, vsubq_s16(n, vdupq_n_s16(16)))));
+}
+#else
 static inline u128 spu_roth(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&15; r._u16[i]= sh ? (uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))) : a._u16[i]; } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_shlqbi(u128 a, u128 b) {
+    const uint32x4_t x = spu__nl(a); const int sh = (int)(b._u32[0] & 7);
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(sh)), vshlq_u32(vextq_u32(x, vdupq_n_u32(0), 1), vdupq_n_s32(sh - 32))));
+}
+#else
 static inline u128 spu_shlqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotqbi(u128 a, u128 b) {
+    const uint32x4_t x = spu__nl(a); const int sh = (int)(b._u32[0] & 7);
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(sh)), vshlq_u32(vextq_u32(x, x, 1), vdupq_n_s32(sh - 32))));
+}
+#else
 static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
 static inline u128 spu_shlqby_ref(u128 a, u128 b){ int sh=b._u32[0]&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 #if SPU__SIMD
 static inline u128 spu_shlqby(u128 a, u128 b){ int sh=b._u32[0]&0x1F; return sh>=16 ? spu_zero() : spu__pshufb(a, spu__t_shl[sh]); }
@@ -655,15 +1125,43 @@ static inline u128 spu_rotqbybi(u128 a, u128 b){ return spu__pshufb(a, spu__t_ro
 #endif
 
 /* ---- Phase 2: rotmahi ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_rotmahi(u128 a, int i7) { return spu__nss16(vshlq_s16(spu__nls16(a), vdupq_n_s16((int16_t)-((0 - i7) & 0x1F)))); }
+#else
 static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
+#endif
 
 /* ---- Phase 2: byte/half immediate compares ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_ceqbi(u128 a, int32_t imm) { return spu__ns8(vceqq_u8(spu__nl8(a), vdupq_n_u8((uint8_t)imm))); }
+#else
 static inline u128 spu_ceqbi(u128 a, int32_t imm)  { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==v)?0xFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_ceqhi(u128 a, int32_t imm) { return spu__ns16(vceqq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_ceqhi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]==v)?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgtbi(u128 a, int32_t imm) { return spu__ns8(vcgtq_u8(spu__nl8(a), vdupq_n_u8((uint8_t)imm))); }
+#else
 static inline u128 spu_clgtbi(u128 a, int32_t imm) { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>v)?0xFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_clgthi(u128 a, int32_t imm) { return spu__ns16(vcgtq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_clgthi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>v)?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgthi(u128 a, int32_t imm) { return spu__ns16(vcgtq_s16(spu__nls16(a), vdupq_n_s16((int16_t)imm))); }
+#else
 static inline u128 spu_cgthi(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>v)?0xFFFFu:0; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_cgtbi(u128 a, int32_t imm) { return spu__ns8(vcgtq_s8(spu__nls8(a), vdupq_n_s8((int8_t)imm))); }
+#else
 static inline u128 spu_cgtbi(u128 a, int32_t imm)  { u128 r; int8_t v=(int8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>v)?0xFFu:0; return r; }
+#endif
 
 /* ---- Phase 2: misc one-offs ---- */
 static inline u128 spu_fscrrd(u128 a) { (void)a; return spu_zero(); }
@@ -683,10 +1181,24 @@ static inline u128 spu_gbb(u128 a) {
     uint32_t v=0; for(int i=0;i<16;i++) v |= ((uint32_t)(a._u8[SPU_W(i)]&1) << (15-i));
     u128 r = spu_zero(); r._u32[0]=v; return r;
 }
+#if SPU__NEON
+SPU__NINL u128 spu_cg(u128 a, u128 b) {
+    const uint32x4_t x = spu__nl(a);
+    return spu__ns(vshrq_n_u32(vcltq_u32(vaddq_u32(x, spu__nl(b)), x), 31));
+}
+#else
 static inline u128 spu_cg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)a._u32[i]+(uint64_t)b._u32[i])>>32); return r; }
+#endif
 /* sumb: sum the 4 bytes of each word. Per CBEA, RT halfword 2i (the HIGH half of
  * word i) = sum of RB's 4 bytes of word i; halfword 2i+1 (LOW half) = sum of RA's
  * 4 bytes of word i. Computed on word VALUES so byte order is irrelevant. */
+#if SPU__NEON
+SPU__NINL u128 spu_sumb(u128 a, u128 b) {
+    /* per word: halfword 2i (high) = sum of b's four bytes, halfword 2i+1 (low) = sum of a's four bytes */
+    const uint32x4_t sa = vpaddlq_u16(vpaddlq_u8(spu__nl8(a))), sb = vpaddlq_u16(vpaddlq_u8(spu__nl8(b)));
+    return spu__ns(vorrq_u32(vshlq_n_u32(sb, 16), sa));
+}
+#else
 static inline u128 spu_sumb(u128 a, u128 b) {
     u128 r;
     for(int i=0;i<4;i++) {
@@ -697,17 +1209,50 @@ static inline u128 spu_sumb(u128 a, u128 b) {
     }
     return r;
 }
+#endif
 /* Borrow generate: carry-out of (b + ~a + 1) == (b >= a unsigned ? 1 : 0).
  * The subtract-side sibling of cg; pairs with sf/sfx for extended subtraction. */
+#if SPU__NEON
+SPU__NINL u128 spu_bg(u128 a, u128 b) { return spu__ns(vshrq_n_u32(vcgeq_u32(spu__nl(b), spu__nl(a)), 31)); }
+#else
 static inline u128 spu_bg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)b._u32[i]+(uint64_t)(~a._u32[i])+1u)>>32); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_addx(u128 a, u128 b, u128 t) { return spu__ns(vaddq_u32(vaddq_u32(spu__nl(a), spu__nl(b)), vandq_u32(spu__nl(t), vdupq_n_u32(1)))); }
+#else
 static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
+#endif
 /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
+#if SPU__NEON
+SPU__NINL u128 spu_mpyh(u128 a, u128 b) { return spu__ns(vshlq_n_u32(vmulq_u32(vshrq_n_u32(spu__nl(a), 16), spu__nl(b)), 16)); }
+#else
 static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s32[i]=((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_mpyhh(u128 a, u128 b) { return spu__nss32(vmull_s16(vshrn_n_s32(spu__nls32(a), 16), vshrn_n_s32(spu__nls32(b), 16))); }
+#else
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_mpys(u128 a, u128 b) { return spu__nss32(vshrq_n_s32(vmull_s16(vmovn_s32(spu__nls32(a)), vmovn_s32(spu__nls32(b))), 16)); }
+#else
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_mpyui(u128 a, int32_t imm) { return spu__ns(vmull_u16(vmovn_u32(spu__nl(a)), vdup_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
+#endif
+#if SPU__NEONF
+SPU__NINL u128 spu_fcmeq(u128 a, u128 b) { return spu__ns(vceqq_f32(vabsq_f32(spu__nlx(a)), vabsq_f32(spu__nlx(b)))); }
+#else
 static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+#endif
+#if SPU__NEONF
+SPU__NINL u128 spu_fcmgt(u128 a, u128 b) { return spu__ns(vcgtq_f32(vabsq_f32(spu__nlx(a)), vabsq_f32(spu__nlx(b)))); }
+#else
 static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
+#endif
 static const uint32_t spu_frest_fraction_lut[32] = {
     0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
     0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
@@ -773,8 +1318,16 @@ static inline u128 spu_frest(u128 a) {
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
  * at the *lower* storage address). Same caveat as the mpy family. */
+#if SPU__NEON
+SPU__NINL u128 spu_xsbh(u128 a) { return spu__nss16(vshrq_n_s16(vshlq_n_s16(spu__nls16(a), 8), 8)); }
+#else
 static inline u128 spu_xsbh(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_xshw(u128 a) { return spu__nss32(vshrq_n_s32(vshlq_n_s32(spu__nls32(a), 16), 16)); }
+#else
 static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
+#endif
 /* xswd: rt.doubleword[d] = sign_extend_64(ra.word[2d+1]) -- the ODD word of
  * each doubleword, because that is the low half in big-endian order.
  *
@@ -788,6 +1341,13 @@ static inline u128 spu_xshw(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (
  * block count was zero and it stopped on its own assert. Unlike its siblings
  * xsbh/xshw, whose source and destination swaps cancel, nothing cancels here.
  * Write the two words explicitly. */
+#if SPU__NEON
+SPU__NINL u128 spu_xswd(u128 a) {
+    const uint32x4_t x = spu__nl(a);
+    /* [sign(w1), w1, sign(w3), w3]: the ODD word of each doubleword sign-extended, big-endian word order */
+    return spu__ns(vtrn2q_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(x), 31)), x));
+}
+#else
 static inline u128 spu_xswd(u128 a) {
     u128 r;
     for (int d = 0; d < 2; d++) {
@@ -797,13 +1357,23 @@ static inline u128 spu_xswd(u128 a) {
     }
     return r;
 }
+#endif
 
 /* ---- Phase 3: OR across ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_orx(u128 a) {
+    uint32x4_t x = spu__nl(a);
+    x = vorrq_u32(x, vextq_u32(x, x, 2));
+    x = vorrq_u32(x, vextq_u32(x, x, 1));
+    return spu__ns(vsetq_lane_u32(vgetq_lane_u32(x, 0), vdupq_n_u32(0), 0));
+}
+#else
 static inline u128 spu_orx(u128 a) {
     u128 r = spu_zero();
     r._u32[0] = a._u32[0] | a._u32[1] | a._u32[2] | a._u32[3];
     return r;
 }
+#endif
 
 /* ---- Phase 3: form-select mask from bits ---- */
 static inline u128 spu_fsm(u128 a) {
@@ -900,15 +1470,54 @@ static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
 
 /* ---- Phase 3: rotate-and-mask family ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_rotm(u128 a, u128 b) {
+    const int32x4_t m = vnegq_s32(vreinterpretq_s32_u32(vandq_u32(vsubq_u32(vdupq_n_u32(0), spu__nl(b)), vdupq_n_u32(0x3F))));
+    return spu__ns(vshlq_u32(spu__nl(a), m));
+}
+#else
 static inline u128 spu_rotm(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotma(u128 a, u128 b) {
+    const int32x4_t m = vnegq_s32(vreinterpretq_s32_u32(vandq_u32(vsubq_u32(vdupq_n_u32(0), spu__nl(b)), vdupq_n_u32(0x3F))));
+    return spu__nss32(vshlq_s32(spu__nls32(a), m));
+}
+#else
 static inline u128 spu_rotma(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rothm(u128 a, u128 b) {
+    const int16x8_t m = vnegq_s16(vreinterpretq_s16_u16(vandq_u16(vsubq_u16(vdupq_n_u16(0), spu__nl16(b)), vdupq_n_u16(0x1F))));
+    return spu__ns16(vshlq_u16(spu__nl16(a), m));
+}
+#else
 static inline u128 spu_rothm(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rothma(u128 a, u128 b) {
+    const int16x8_t m = vnegq_s16(vreinterpretq_s16_u16(vandq_u16(vsubq_u16(vdupq_n_u16(0), spu__nl16(b)), vdupq_n_u16(0x1F))));
+    return spu__nss16(vshlq_s16(spu__nls16(a), m));
+}
+#else
 static inline u128 spu_rothma(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); } return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rothmi(u128 a, int i7) { return spu__ns16(vshlq_u16(spu__nl16(a), vdupq_n_s16((int16_t)-((0 - i7) & 0x1F)))); }
+#else
 static inline u128 spu_rothmi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotqmbi(u128 a, u128 b) {
+    const uint32x4_t x = spu__nl(a); const int sh = (0 - (int)b._u32[0]) & 7;
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(-sh)), vshlq_u32(vextq_u32(vdupq_n_u32(0), x, 3), vdupq_n_s32(32 - sh))));
+}
+#else
 static inline u128 spu_rotqmbi(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
 static inline u128 spu_rotqmby_ref(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 #if SPU__SIMD
 static inline u128 spu_rotqmby(u128 a, u128 b){ int sh=(0-(int)b._u32[0])&0x1F; return sh>=16 ? spu_zero() : spu__pshufb(a, spu__t_shr[sh]); }
@@ -921,10 +1530,17 @@ static inline u128 spu_rotqmbybi(u128 a, u128 b){ int sh=(0-((int)b._u32[0]>>3))
 #else
 #define spu_rotqmbybi spu_rotqmbybi_ref
 #endif
+#if SPU__NEON
+SPU__NINL u128 spu_rotqmbii(u128 a, int i7) {
+    const uint32x4_t x = spu__nl(a); const int sh = (0 - i7) & 7;
+    return spu__ns(vorrq_u32(vshlq_u32(x, vdupq_n_s32(-sh)), vshlq_u32(vextq_u32(vdupq_n_u32(0), x, 3), vdupq_n_s32(32 - sh))));
+}
+#else
 static inline u128 spu_rotqmbii(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#endif
 static inline u128 spu_rotqmbyi_ref(u128 a, int i7)  { int sh=(0-i7)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 #if SPU__SIMD
 static inline u128 spu_rotqmbyi(u128 a, int i7){ int sh=(0-i7)&0x1F; return sh>=16 ? spu_zero() : spu__pshufb(a, spu__t_shr[sh]); }
@@ -933,13 +1549,39 @@ static inline u128 spu_rotqmbyi(u128 a, int i7){ int sh=(0-i7)&0x1F; return sh>=
 #endif
 
 /* ---- Phase 3: halfword/byte immediate logic ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_andhi(u128 a, int32_t imm) { return spu__ns16(vandq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_andhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]&v; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_andbi(u128 a, int32_t imm) { return spu__ns8(vandq_u8(spu__nl8(a), vdupq_n_u8((uint8_t)imm))); }
+#else
 static inline u128 spu_andbi(u128 a, int32_t imm) { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]&v;   return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_orhi(u128 a, int32_t imm) { return spu__ns16(vorrq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_orhi(u128 a, int32_t imm)  { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]|v; return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_orbi(u128 a, int32_t imm) { return spu__ns8(vorrq_u8(spu__nl8(a), vdupq_n_u8((uint8_t)imm))); }
+#else
 static inline u128 spu_orbi(u128 a, int32_t imm)  { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]|v;   return r; }
+#endif
+#if SPU__NEON
+SPU__NINL u128 spu_xorhi(u128 a, int32_t imm) { return spu__ns16(veorq_u16(spu__nl16(a), vdupq_n_u16((uint16_t)imm))); }
+#else
 static inline u128 spu_xorhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]^v; return r; }
+#endif
 
 /* ---- Phase 3: borrow-generate extended ---- */
+#if SPU__NEON
+SPU__NINL u128 spu_bgx(u128 a, u128 b, u128 t) {
+    const uint32x4_t y = spu__nl(b), s = vaddq_u32(y, vmvnq_u32(spu__nl(a))), s2 = vaddq_u32(s, vandq_u32(spu__nl(t), vdupq_n_u32(1)));
+    return spu__ns(vshrq_n_u32(vorrq_u32(vcltq_u32(s, y), vcltq_u32(s2, s)), 31));
+}
+#else
 static inline u128 spu_bgx(u128 a, u128 b, u128 t) {
     u128 r;
     for(int i=0;i<4;i++) {
@@ -948,6 +1590,7 @@ static inline u128 spu_bgx(u128 a, u128 b, u128 t) {
     }
     return r;
 }
+#endif
 
 /* ---- Phase 3: mfspr stub ---- */
 static inline u128 spu_mfspr(u128 a) { (void)a; return spu_zero(); }
@@ -957,7 +1600,200 @@ static inline u128 spu_il(int32_t imm)   { return spu_splat_u32((uint32_t)imm); 
 static inline u128 spu_ila(uint32_t i18) { return spu_splat_u32(i18 & 0x3FFFF); }
 static inline u128 spu_ilh(uint16_t imm) { return spu_splat_u16(imm); }
 static inline u128 spu_ilhu(uint16_t imm){ return spu_splat_u32((uint32_t)imm << 16); }
+#if SPU__NEON
+SPU__NINL u128 spu_iohl(u128 a, uint16_t imm) { return spu__ns(vorrq_u32(spu__nl(a), vdupq_n_u32((uint32_t)imm))); }
+#else
 static inline u128 spu_iohl(u128 a, uint16_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
+#endif
+
+/* ---- scalar reference copies (all builds) ---------------------------------------------------------------------
+ * spu_<op>_ref is the scalar body spu_<op> had before it got a NEON form; on builds without a fast form the two
+ * are the same code. They exist so that native/spu_neon/spu_neon_selftest.c can run every fast body against its
+ * scalar reference (host: SSE paths and, through native/spu_neon/neon_shim, the NEON bodies; console: the NEON
+ * bodies on the real CPU). Nothing else calls them. */
+static inline u128 spu_splat_u32_ref(uint32_t v) {
+    u128 r; r._u32[0]=v; r._u32[1]=v; r._u32[2]=v; r._u32[3]=v; return r;
+}
+static inline u128 spu_splat_u16_ref(uint16_t v) {
+    u128 r; for (int i=0;i<8;i++) r._u16[i]=v; return r;
+}
+static inline u128 spu_splat_u8_ref(uint8_t v) {
+    u128 r; for (int i=0;i<16;i++) r._u8[i]=v; return r;
+}
+static inline u128 spu_link_ref(uint32_t addr) {
+    u128 r; r._u32[0]=addr; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
+static inline u128 spu_pref_u32_ref(uint32_t v) {
+    u128 r; r._u32[0]=v; r._u32[1]=0; r._u32[2]=0; r._u32[3]=0; return r;
+}
+static inline u128 spu_a_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]; return r; }
+static inline u128 spu_sf_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]-a._u32[i]; return r; }
+static inline u128 spu_ah_ref(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+b._u16[i]; return r; }
+static inline u128 spu_sfh_ref(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=b._u16[i]-a._u16[i]; return r; }
+static inline u128 spu_ai_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+(uint32_t)imm; return r; }
+static inline u128 spu_ahi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]+(uint16_t)imm; return r; }
+static inline u128 spu_sfi_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)imm-a._u32[i]; return r; }
+static inline u128 spu_sfhi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)imm-a._u16[i]; return r; }
+static inline u128 spu_sfx_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
+static inline u128 spu_addx_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
+static inline u128 spu_cg_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)a._u32[i]+(uint64_t)b._u32[i])>>32); return r; }
+static inline u128 spu_bg_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)b._u32[i]+(uint64_t)(~a._u32[i])+1u)>>32); return r; }
+static inline u128 spu_cgx_ref(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)(t._u32[i]&1u)+a._u32[i]+b._u32[i])>>32); return r; }
+static inline u128 spu_bgx_ref(u128 a, u128 b, u128 t) {
+    u128 r;
+    for(int i=0;i<4;i++) {
+        uint64_t s = (uint64_t)b._u32[i] + (uint64_t)(~a._u32[i]) + (uint64_t)(t._u32[i]&1);
+        r._u32[i] = (uint32_t)(s >> 32);
+    }
+    return r;
+}
+static inline u128 spu_mpy_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]; return r; }
+static inline u128 spu_mpyu_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
+static inline u128 spu_mpya_ref(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
+static inline u128 spu_mpyi_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
+static inline u128 spu_mpyui_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
+static inline u128 spu_mpyh_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s32[i]=((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
+static inline u128 spu_mpyhh_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
+static inline u128 spu_mpyhhu_ref(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
+static inline u128 spu_mpys_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
+static inline u128 spu_mpyhha_ref(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
+static inline u128 spu_mpyhhau_ref(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
+static inline u128 spu_and_ref(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]&b._u64[0]; r._u64[1]=a._u64[1]&b._u64[1]; return r; }
+static inline u128 spu_or_ref(u128 a, u128 b)  { u128 r; r._u64[0]=a._u64[0]|b._u64[0]; r._u64[1]=a._u64[1]|b._u64[1]; return r; }
+static inline u128 spu_xor_ref(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]^b._u64[0]; r._u64[1]=a._u64[1]^b._u64[1]; return r; }
+static inline u128 spu_nand_ref(u128 a, u128 b){ u128 r; r._u64[0]=~(a._u64[0]&b._u64[0]); r._u64[1]=~(a._u64[1]&b._u64[1]); return r; }
+static inline u128 spu_nor_ref(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]|b._u64[0]); r._u64[1]=~(a._u64[1]|b._u64[1]); return r; }
+static inline u128 spu_andc_ref(u128 a, u128 b){ u128 r; r._u64[0]=a._u64[0]&~b._u64[0]; r._u64[1]=a._u64[1]&~b._u64[1]; return r; }
+static inline u128 spu_orc_ref(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]|~b._u64[0]; r._u64[1]=a._u64[1]|~b._u64[1]; return r; }
+static inline u128 spu_eqv_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
+static inline u128 spu_andi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]&(uint32_t)imm; return r; }
+static inline u128 spu_ori_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
+static inline u128 spu_xori_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]^(uint32_t)imm; return r; }
+static inline u128 spu_andhi_ref(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]&v; return r; }
+static inline u128 spu_orhi_ref(u128 a, int32_t imm)  { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]|v; return r; }
+static inline u128 spu_xorhi_ref(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]^v; return r; }
+static inline u128 spu_andbi_ref(u128 a, int32_t imm) { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]&v;   return r; }
+static inline u128 spu_orbi_ref(u128 a, int32_t imm)  { u128 r; uint8_t  v=(uint8_t)imm;  for(int i=0;i<16;i++) r._u8[i]=a._u8[i]|v;   return r; }
+static inline u128 spu_xorbi_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
+static inline u128 spu_iohl_ref(u128 a, uint16_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
+static inline u128 spu_selb_ref(u128 a, u128 b, u128 c) {
+    u128 r;
+    r._u64[0]=(a._u64[0]&~c._u64[0])|(b._u64[0]&c._u64[0]);
+    r._u64[1]=(a._u64[1]&~c._u64[1])|(b._u64[1]&c._u64[1]);
+    return r;
+}
+static inline u128 spu_clz_ref(u128 a)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)spu_clz32(a._u32[i]); return r; }
+static inline u128 spu_ceq_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]==b._u32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_ceqh_ref(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]==b._u16[i])?0xFFFFu:0; return r; }
+static inline u128 spu_ceqb_ref(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==b._u8[i])?0xFFu:0; return r; }
+static inline u128 spu_cgt_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>b._s32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_cgth_ref(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>b._s16[i])?0xFFFFu:0; return r; }
+static inline u128 spu_cgtb_ref(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>b._s8[i])?0xFFu:0; return r; }
+static inline u128 spu_clgt_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>b._u32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_clgth_ref(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>b._u16[i])?0xFFFFu:0; return r; }
+static inline u128 spu_clgtb_ref(u128 a, u128 b){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>b._u8[i])?0xFFu:0; return r; }
+static inline u128 spu_ceqi_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]==imm)?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_cgti_ref(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>imm)?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_clgti_ref(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>(uint32_t)imm)?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_ceqbi_ref(u128 a, int32_t imm)  { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==v)?0xFFu:0; return r; }
+static inline u128 spu_ceqhi_ref(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]==v)?0xFFFFu:0; return r; }
+static inline u128 spu_clgtbi_ref(u128 a, int32_t imm) { u128 r; uint8_t v=(uint8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>v)?0xFFu:0; return r; }
+static inline u128 spu_clgthi_ref(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>v)?0xFFFFu:0; return r; }
+static inline u128 spu_cgthi_ref(u128 a, int32_t imm)  { u128 r; int16_t v=(int16_t)imm; for(int i=0;i<8;i++) r._u16[i]=(a._s16[i]>v)?0xFFFFu:0; return r; }
+static inline u128 spu_cgtbi_ref(u128 a, int32_t imm)  { u128 r; int8_t v=(int8_t)imm; for(int i=0;i<16;i++) r._u8[i]=(a._s8[i]>v)?0xFFu:0; return r; }
+static inline u128 spu_shli_ref(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
+static inline u128 spu_shlhi_ref(u128 a, int sh) { u128 r; sh&=0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); return r; }
+static inline u128 spu_roti_ref(u128 a, int sh)  { u128 r; sh&=31; for(int i=0;i<4;i++) r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; return r; }
+static inline u128 spu_rothi_ref(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i++) r._u16[i]=(uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))); return r; }
+static inline u128 spu_rotmi_ref(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
+static inline u128 spu_rotmai_ref(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
+static inline u128 spu_rotmhi_ref(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+static inline u128 spu_rothmi_ref(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+static inline u128 spu_rotmahi_ref(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
+static inline u128 spu_shl_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
+static inline u128 spu_shlh_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
+static inline u128 spu_rot_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
+static inline u128 spu_roth_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&15; r._u16[i]= sh ? (uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))) : a._u16[i]; } return r; }
+static inline u128 spu_rotm_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
+static inline u128 spu_rotma_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
+static inline u128 spu_rothm_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); } return r; }
+static inline u128 spu_rothma_ref(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); } return r; }
+static inline u128 spu_shlqbii_ref(u128 a, int sh) { sh&=7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_rotqbii_ref(u128 a, int sh) { sh&=7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_shlqbi_ref(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_rotqbi_ref(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_rotqmbii_ref(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_rotqmbi_ref(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; if(!sh) return a;
+    uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+    uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
+    u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+static inline u128 spu_xsbh_ref(u128 a) { u128 r; for(int i=0;i<8;i++) r._s16[i] = (int8_t)a._u8[2*i]; return r; }
+static inline u128 spu_xshw_ref(u128 a) { u128 r; for(int i=0;i<4;i++) r._s32[i] = (int16_t)a._s16[2*i]; return r; }
+static inline u128 spu_xswd_ref(u128 a) {
+    u128 r;
+    for (int d = 0; d < 2; d++) {
+        int32_t v = (int32_t)a._u32[2*d + 1];
+        r._u32[2*d]     = (uint32_t)(v >> 31);   /* sign fill (high word) */
+        r._u32[2*d + 1] = (uint32_t)v;           /* value      (low word) */
+    }
+    return r;
+}
+static inline u128 spu_orx_ref(u128 a) {
+    u128 r = spu_zero();
+    r._u32[0] = a._u32[0] | a._u32[1] | a._u32[2] | a._u32[3];
+    return r;
+}
+static inline u128 spu_absdb_ref(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
+static inline u128 spu_avgb_ref(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
+static inline u128 spu_sumb_ref(u128 a, u128 b) {
+    u128 r;
+    for(int i=0;i<4;i++) {
+        uint32_t wa=a._u32[i], wb=b._u32[i];
+        uint32_t sa=((wa>>24)&0xFF)+((wa>>16)&0xFF)+((wa>>8)&0xFF)+(wa&0xFF);
+        uint32_t sb=((wb>>24)&0xFF)+((wb>>16)&0xFF)+((wb>>8)&0xFF)+(wb&0xFF);
+        r._u32[i]=(sb<<16)|sa;
+    }
+    return r;
+}
+static inline u128 spu_il_ref(int32_t imm)   { return spu_splat_u32_ref((uint32_t)imm); }
+static inline u128 spu_ila_ref(uint32_t i18) { return spu_splat_u32_ref(i18 & 0x3FFFF); }
+static inline u128 spu_ilh_ref(uint16_t imm) { return spu_splat_u16_ref(imm); }
+static inline u128 spu_ilhu_ref(uint16_t imm){ return spu_splat_u32_ref((uint32_t)imm << 16); }
+
+/* single precision: scalar loops with the spu_xfv clamp (the bodies of the !SPU__FSIMD definitions above) */
+static inline u128 spu_fa_ref(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
+static inline u128 spu_fs_ref(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
+static inline u128 spu_fm_ref(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
+static inline u128 spu_fma_ref(u128 a, u128 b, u128 c)  { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fms_ref(u128 a, u128 b, u128 c)  { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], b._f32[i], -c._f32[i]); return r; }
+static inline u128 spu_fnms_ref(u128 a, u128 b, u128 c) { u128 r; a=spu_xfv(a); b=spu_xfv(b); c=spu_xfv(c); for(int i=0;i<4;i++) r._f32[i]=fmaf(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fceq_ref(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_cflts_ref(u128 a, int i8){ u128 r; double f=spu__p2(173-i8); a=spu_xfv(a);
+    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
+static inline u128 spu_cfltu_ref(u128 a, int i8){ u128 r; double f=spu__p2(173-i8); a=spu_xfv(a);
+    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
+static inline u128 spu_csflt_ref(u128 a, int i8){ u128 r; double f=spu__p2(i8-155);
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+static inline u128 spu_cuflt_ref(u128 a, int i8){ u128 r; double f=spu__p2(i8-155);
+    for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+static inline u128 spu_fcgt_ref(u128 a, u128 b) { u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fcmeq_ref(u128 a, u128 b){ u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+static inline u128 spu_fcmgt_ref(u128 a, u128 b){ u128 r; a=spu_xfv(a); b=spu_xfv(b); for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
 
 #ifdef __cplusplus
 }

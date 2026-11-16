@@ -231,9 +231,11 @@ typedef struct spu_context {
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask */
+    /* Event status / mask. event_ack_mask (Decision 33 / C1a) is the hardware edge latch: bits the SPU has
+     * acknowledged, so the same standing condition cannot be reported again until its producer re-signals. */
     uint32_t event_status;
     uint32_t event_mask;
+    uint32_t event_ack_mask;
 
     /* Channels */
     spu_channel ch_out_mbox;        /* SPU -> PPU outbound mailbox */
@@ -475,6 +477,30 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
+/* SPU__NEON: AArch64 Advanced SIMD bodies for the 128-bit SPU helpers (spu_helpers.h) and the local-store
+ * accessors below. 1 only on an AArch64 compiler with NEON and no SSE (the Nintendo Switch build, GCC
+ * devkitA64, -march=armv8-a+crc+crypto); 0 everywhere else, so every x86 / host build keeps exactly the code
+ * it had. -DSPU_SCALAR_HELPERS forces the scalar reference bodies on AArch64 too (A/B and bisecting).
+ * SPU_NEON_SHIM is set only by native/spu_neon's host test, which compiles the NEON bodies on x86 against a
+ * portable emulation of <arm_neon.h> (native/spu_neon/neon_shim). */
+#ifndef SPU__NEON
+#if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(__SSE2__) && \
+    (defined(__aarch64__) || defined(SPU_NEON_SHIM))
+#define SPU__NEON 1
+#else
+#define SPU__NEON 0
+#endif
+#endif
+#if SPU__NEON
+#ifdef __cplusplus
+}   /* arm_neon.h must not be included inside extern "C" */
+#endif
+#include <arm_neon.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+#endif
+
 /* v30b: whole-quadword BE<->host swizzle as one pshufb when SSSE3 is on (the
  * lifted SPU TUs and the runtime build with -msse4.1 or better). */
 #if defined(__SSSE3__) || defined(__SSE4_1__) || defined(__AVX__)
@@ -554,6 +580,10 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     {   __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p),
                                      _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12));
         memcpy(&v, &x, 16); }
+#elif SPU__NEON
+    /* AArch64: ld1 + rev32 (reverse the four bytes of every 32-bit lane) == the pshufb above. */
+    {   uint8x16_t x = vrev32q_u8(vld1q_u8(p));
+        memcpy((void*)&v, &x, 16); }
 #elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -640,6 +670,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     {   __m128i x; memcpy(&x, &val, 16);
         _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(x,
                          _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12))); }
+#elif SPU__NEON
+    /* AArch64: rev32 + st1, the inverse of the read above. */
+    {   uint8x16_t x; memcpy(&x, &val, 16);
+        vst1q_u8(p, vrev32q_u8(x)); }
 #elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -782,9 +816,19 @@ static inline int spu_channel_has_data(const spu_channel* ch)
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
 
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+/* Native owned executor: there is NO thread-local continuation slot. Every generated producer (SPU_XFER, SPU_RET /
+ * SPU_RET_REG at host_depth 0, and the generated literal `g_spu_trampoline_fn = spu_indirect_branch;` sites) publishes
+ * into the caller-owned executor selected by its explicit ctx (closed first-subobject contract, spu_execution_port.h).
+ * The accessor stops the owner instead of overwriting pending work. Generated functions all take `spu_context* ctx`;
+ * a native use site without one fails to compile (no silent fallback). */
+void (**ps3_spu_native_continuation_slot(spu_context* ctx))(spu_context*);
+#  define g_spu_trampoline_fn (*ps3_spu_native_continuation_slot(ctx))
+#else
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+#endif
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
@@ -873,6 +917,9 @@ static inline __attribute__((always_inline)) void spu_tlc(spu_context* ctx, void
  * wrch per 10 s. The lifted code's channel number is a constant, so the inline switch folds to one store. Same gate
  * as v98f (g_spu_wrch_fast_pub mirrors SPU_WRCH_FAST / SPU_CHHIST, set by the real spu_wrch on first use; PS3_AB
  * bit 0 -> real path). Every other channel -> the real spu_wrch. -DSPU_WRCH_OUTLINE = old (plain calls). */
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+void spu_wrch(spu_context* ctx,uint32_t channel,u128 value);
+#else
 SPU_GATE int g_spu_wrch_fast_pub = -1;
 #if !defined(SPU_CHANNELS_IMPL) && !defined(SPU_WRCH_OUTLINE)
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
@@ -898,6 +945,7 @@ static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx,
  * redeclarations of this static inline -- legal C (internal linkage carries over). */
 #  define spu_wrch spu_wrch_inl
 #endif
+#endif
 
 /* v153 (FPS/audio): direct tail transfer. A static cross-function branch in
  * lifted code used to set g_spu_trampoline_fn and RETURN to the drain loop,
@@ -917,7 +965,10 @@ static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx,
 #  define SPU_PCH_NOTE(ctx) ((void)0)
 #endif
 SPU_GATE int g_spu_dtail = -1;   /* -1 = not initialised (spu_drain.c), 0 off, 1 on */
-#if defined(__clang__)
+#if defined(PS3_NATIVE_SPU_EXECUTOR)
+/* Native: publish into the owner of the explicit ctx and return to its drain / top-level runner (no direct tail). */
+#  define SPU_XFER(ctx, F) do { *ps3_spu_native_continuation_slot(ctx) = (F); return; } while (0)
+#elif defined(__clang__)
 #  define SPU_XFER(ctx, F) do {                                             \
         if (__builtin_expect(g_spu_dtail > 0, 1) && !g_spu_tlc_slow &&      \
             !g_yz_lockstep_on &&                                            \
@@ -946,7 +997,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
  * the real function. -DSPU_DRAIN_CALL_OUTLINE restores a plain call everywhere. */
 SPU_GATE int g_spu_drain_fastret_pub = -1;          /* mirror of spu_drain.c s_drain_fastret */
 extern SPU_THREAD_LOCAL int g_irq_live_n;            /* spu_drain.c: irq frames registered on this thread */
-#if !defined(SPU_DRAIN_IMPL) && !defined(SPU_DRAIN_CALL_OUTLINE)
+#if !defined(SPU_DRAIN_IMPL) && !defined(SPU_DRAIN_CALL_OUTLINE) && !defined(PS3_NATIVE_SPU_EXECUTOR)
 static inline __attribute__((always_inline)) void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
 {
     if (__builtin_expect(g_spu_drain_fastret_pub > 0 && !g_spu_trampoline_fn &&
@@ -1006,6 +1057,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
     }
 }
 
+#ifndef PS3_NATIVE_SPU_EXECUTOR  /* native: no SPU_DRAIN (the owner's runner drains); a use fails to build */
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
@@ -1036,11 +1088,27 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             _tf(ctx);                                          \
         }                                                      \
     } while (0)
+#endif
 
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
  * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. */
+#ifdef PS3_NATIVE_SPU_EXECUTOR
+/* Native: identical semantics; the host_depth-0 indirect marker is published into the owner of the explicit ctx. */
+#define SPU_RET(ctx) do {                                      \
+        (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
+        if ((ctx)->host_depth == 0)                            \
+            *ps3_spu_native_continuation_slot(ctx) = spu_indirect_branch; \
+        return;                                                \
+    } while (0)
+#define SPU_RET_REG(ctx, n) do {                               \
+        (ctx)->pc = (ctx)->gpr[n]._u32[0];                     \
+        if ((ctx)->host_depth == 0)                            \
+            *ps3_spu_native_continuation_slot(ctx) = spu_indirect_branch; \
+        return;                                                \
+    } while (0)
+#else
 #define SPU_RET(ctx) do {                                      \
         (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
         if ((ctx)->host_depth == 0)                            \
@@ -1055,6 +1123,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * never match -- it restarts dispatch from r0's stale value instead. Same
  * host-frame return as SPU_RET, publishing the register actually branched. */
 #define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

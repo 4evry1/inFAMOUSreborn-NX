@@ -15,6 +15,7 @@
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+#include "spurs_kernel_startup.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/hz_stats.h"   /* v225A hitch attribution (FIOS_HLE inflate time) */
 #include <stdio.h>
@@ -454,7 +455,9 @@ static struct SpursInst {
     u32           ea;          /* 0 = free */
     u32           nspus;
     char          prefix[16];
-    volatile long kernel_live; /* poll thread started */
+    volatile LONG kernel_live; /* kernel startup has been claimed */
+    volatile LONG kernel_gate; /* workers wait here until their parts are final */
+    u32           kernel_nparts;
     int           solo;        /* v29: SPURS_WKL_SOLO threads in use */
 } s_inst[MAX_SPURS_INST];
 
@@ -465,7 +468,12 @@ static struct SpursInst* spurs_inst_find(u32 ea)
     return NULL;
 }
 
-struct SpursKArg { struct SpursInst* si; u32 part; u32 nparts; };
+struct SpursKArg {
+    struct SpursInst* si;
+    u32 part;
+    u32 nparts;
+    volatile int32_t state;
+};
 
 /* v29 SPURS_WKL_SOLO (default "0"; empty or "-" = off): comma-separated wids that each
  * get a DEDICATED kernel thread (threads 0..nsolo-1) on multi-SPU instances; the
@@ -800,6 +808,67 @@ static u32 spurs_wkl_part(u32 wid, u32 nparts, int solo)
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 static void spurs_freeze_dump(const char* why);   /* v103B: F8 dump of every workload + lane */
 
+static int spurs_kernel_wait_ready(struct SpursKArg* ka, int require_live, int timeout_ms)
+{
+    LARGE_INTEGER frequency, started, now;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
+        for (int i = 0; i <= timeout_ms; i++) {
+            if (require_live ? ps3_spurs_kernel_is_live(&ka->state)
+                             : ps3_spurs_kernel_is_started(&ka->state)) return 1;
+            Sleep(1);
+        }
+        return 0;
+    }
+    QueryPerformanceCounter(&started);
+    const LONGLONG timeout_ticks = (LONGLONG)timeout_ms * frequency.QuadPart / 1000;
+    for (;;) {
+        if (require_live ? ps3_spurs_kernel_is_live(&ka->state)
+                         : ps3_spurs_kernel_is_started(&ka->state)) return 1;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - started.QuadPart >= timeout_ticks) return 0;
+        Sleep(1);
+    }
+}
+
+static struct SpursKArg* spurs_kernel_start_one(struct SpursInst* si, int timeout_ms,
+                                                unsigned* failures)
+{
+    static const SIZE_T stack_sizes[2] = {1u << 20, 256u << 10};
+
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        struct SpursKArg* ka = (struct SpursKArg*)calloc(1, sizeof(*ka));
+        if (!ka) {
+            fprintf(stderr, "[spurs-kern] startup allocation failed\n");
+            (*failures)++;
+            return NULL;
+        }
+        ka->si = si;
+        ka->state = PS3_SPURS_KERNEL_PENDING;
+        HANDLE thread = CreateThread(NULL, stack_sizes[attempt], spurs_kernel_thread, ka, 0, NULL);
+        if (!thread) {
+            const DWORD error = GetLastError();
+            fprintf(stderr, "[spurs-kern] CreateThread failed, stack %lu KiB, error %lu\n",
+                    (unsigned long)(stack_sizes[attempt] >> 10), (unsigned long)error);
+            free(ka);
+            (*failures)++;
+            continue;
+        }
+        CloseHandle(thread);
+        if (spurs_kernel_wait_ready(ka, 0, timeout_ms)) return ka;
+
+        /* A late starter loses this transition and exits before reading its
+         * part or taking a kick slot. The argument block stays allocated for
+         * that possible late entry; it is a few bytes once per instance. */
+        if (ps3_spurs_kernel_abandon(&ka->state)) {
+            fprintf(stderr, "[spurs-kern] worker start timed out after %d ms; abandoned\n", timeout_ms);
+            return NULL;
+        }
+        if (ps3_spurs_kernel_is_started(&ka->state)) return ka;
+        return NULL;
+    }
+    return NULL;
+}
+
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
     { extern void (*volatile g_ps3_fz_spurs_dump)(const char*); g_ps3_fz_spurs_dump = spurs_freeze_dump; }   /* sys_ppu_thread.c */
@@ -822,8 +891,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
-    if (!si->kernel_live) {
-        si->kernel_live = 1;
+    if (InterlockedCompareExchange(&si->kernel_live, 1, 0) == 0) {
         /* SPURS_WKL_THREADS (2026-10-04, default = nSpus, max 6): several
          * kernel threads per instance, each owning a FIXED subset of workloads
          * (wid % n == part). A workload only ever runs on its own thread and
@@ -843,13 +911,38 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
         /* v29: + one dedicated thread per SPURS_WKL_SOLO wid (multi-SPU instances). */
         spurs_wkl_map_init();
         if (si->nspus > 1 && nparts > 1 && s_nsolo) { si->solo = 1; nparts += s_nsolo; }
-        for (u32 t = 0; t < nparts; t++) {
-            struct SpursKArg* ka = (struct SpursKArg*)malloc(sizeof *ka);
-            ka->si = si; ka->part = t; ka->nparts = nparts;
-            CreateThread(NULL, 1u << 20, spurs_kernel_thread, ka, 0, NULL);
+        const u32 requested = nparts;
+        struct SpursKArg* live[16];
+        unsigned live_count = 0, failures = 0;
+        for (u32 t = 0; t < requested && live_count < 16; t++) {
+            const int timeout_ms = live_count == 0 ? 3000 : 500;
+            struct SpursKArg* ka = spurs_kernel_start_one(si, timeout_ms, &failures);
+            if (ka) live[live_count++] = ka;
         }
-        fprintf(stderr, "[spurs-kern] \"%s\" %u kernel thread(s) (SPURS_WKL_THREADS, %u solo)\n",
-                si->prefix, nparts, si->solo ? s_nsolo : 0u);
+        if (!live_count) {
+            InterlockedExchange(&si->kernel_live, 0);
+            fprintf(stderr, "[spurs-kern] \"%s\" startup failed: no kernel worker became ready\n",
+                    si->prefix);
+            return CELL_SPURS_CORE_ERROR_NOMEM;
+        }
+
+        /* No worker reads its part until the gate opens. If some host starts
+         * failed, renumber only the workers that did start so every workload
+         * still has exactly one live owner. */
+        for (u32 t = 0; t < live_count; t++) {
+            live[t]->part = t;
+            live[t]->nparts = live_count;
+        }
+        si->kernel_nparts = live_count;
+        __atomic_store_n(&si->kernel_gate, 1, __ATOMIC_RELEASE);
+
+        const u32 owner = spurs_wkl_part(0, live_count, si->solo);
+        const int owner_live = spurs_kernel_wait_ready(live[owner], 1, 2000);
+        fprintf(stderr,
+                "[spurs-kern] \"%s\" startup: requested %u, live %u, failures %u; "
+                "wid0 owner part %u %s (SPURS_WKL_THREADS, %u solo)\n",
+                si->prefix, requested, live_count, failures, owner,
+                owner_live ? "LIVE" : "NOT LIVE", si->solo ? s_nsolo : 0u);
     }
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
@@ -3805,7 +3898,9 @@ void ps3_taskwait_begin(void)
     g_spurs_tw_open_us = t_tw_t0;
     t_tw_marked = 0; t_tw_k = 0; t_tw_adapt_scans = t_tw_adapt_pauses = 0;
     t_tw_wid = spu_laneprof_on() ? tw_wid_of_wait() : -1;   /* v97f [TWCUR] */
+#ifdef _WIN32
     if (s_w16p_mode != 0) w16p_begin(t_tw_wid >= 0 ? t_tw_wid : tw_wid_of_wait());   /* v241A W16PROF */
+#endif
     if (t_tw_wid >= 0) {   /* v241A [TWSPLIT] */
         if (!s_tws_lim) { LARGE_INTEGER f, q0, q1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
             const unsigned long long c0 = __rdtsc(); do QueryPerformanceCounter(&q1); while (q1.QuadPart - q0.QuadPart < f.QuadPart / 100);
@@ -4016,13 +4111,15 @@ static int spurs_inst1_hot(void)
 }
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
+    struct SpursKArg* ka = (struct SpursKArg*)p;
+    if (!ps3_spurs_kernel_claim_start(&ka->state)) return 0;
+    while (!__atomic_load_n(&ka->si->kernel_gate, __ATOMIC_ACQUIRE)) Sleep(1);
+    struct SpursInst* si = ka->si;
+    const u32 k_part = ka->part, k_nparts = ka->nparts;
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     { extern void ps3_prof_register_spu_thread(void); ps3_prof_register_spu_thread(); }   /* v63 PS3_PROF_MAIN */
-    struct SpursKArg* ka = (struct SpursKArg*)p;
-    struct SpursInst* si = ka->si;
-    const u32 k_part = ka->part, k_nparts = ka->nparts;
 #ifdef _WIN32
     /* Instance 0 / part 0 owns inFamous' main CTaskMgr workload (wid 0).
      * Match its lane helpers' policy without forcing the other kernel threads
@@ -4067,6 +4164,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     fprintf(stderr, "[spurs-kern] \"%s\" poll thread live: ea=0x%08X pm=%s\n",
             si->prefix, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
     fflush(stderr);
+    ps3_spurs_kernel_mark_live(&ka->state);
 
     /* Instance change detector (SPURS_KERN_WATCH=1).
      *
@@ -4141,7 +4239,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 }
               }
             }
-            if (kick_slot == 0) {   /* v82: one [SPURS-KICK] line per 10 s */
+            static int s_kick_log = -1;
+            if (s_kick_log < 0) {
+                const char* e = getenv("SPURS_KICK_LOG");
+                s_kick_log = (e && *e == '0') ? 0 : 1;
+            }
+            if (s_kick_log && kick_slot == 0) {   /* v82: one [SPURS-KICK] line per 10 s */
                 static LONGLONG t_kr = 0;
                 if (!t_kr) t_kr = now.QuadPart;
                 else if (now.QuadPart - t_kr >= s_freq * 10) {
@@ -6225,7 +6328,9 @@ static int fios_hle_try(uint32_t q, uint32_t data)
     const uint32_t src = w[0], dst = w[1], csz = w[2], n = w[3], st = w[4], ef = w[5];
     const uint32_t bits = w[6] >> 16, skip = w[6] & 0xFFFFu;
     LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
+#if PS3_HZ_TELEMETRY()
     const unsigned long long _hz0 = hz_tsc();   /* v225A */
+#endif
     const char* why = 0;
     if (!bits || !src || !dst || !csz || !n || !st || !ef) why = "zero field";
     else if (csz > 0x20000u || skip + n > 0x10000u) why = "size out of range";
@@ -6249,8 +6354,10 @@ static int fios_hle_try(uint32_t q, uint32_t data)
     }
     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
     const long long us = (t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart;
+#if PS3_HZ_TELEMETRY()
     { const long long _hzd = (long long)(hz_tsc() - _hz0); hz_add(HZ_FIOS_TSC, _hzd); hz_add(HZ_FIOS_N, 1);   /* v225A */
       if (ps3_hz_is_main()) hz_add(HZ_FIOS_MAIN_TSC, _hzd); }
+#endif
     if (why) {
         InterlockedIncrement64(&s_fh_fb);
         static int nf = 0;

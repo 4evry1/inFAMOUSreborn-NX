@@ -32,6 +32,7 @@
  * table. It comes first: everything below is written against that struct. */
 #ifndef _WIN32
 #include <sys/mman.h>
+#include "msvc_compat.h"
 #endif
 #include "ppu_recomp.h"
 
@@ -280,7 +281,11 @@ static DWORD WINAPI frame_clock(LPVOID)
                     __llvm_profile_write_file();
 #endif
                     fflush(NULL);
+#ifdef _WIN32
                     TerminateProcess(GetCurrentProcess(), 0);
+#else
+                    ::_Exit(0);
+#endif
                 }
                 continue;
             }
@@ -535,6 +540,32 @@ static void set_default_env(const char* k, const char* v)
 #else
     setenv(k, v, 0);
 #endif
+}
+static bool program_name_has(const char* path, const char* tag)
+{
+    const char* name = path ? path : "";
+    for (const char* p = name; *p; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
+    return strstr(name, tag) != NULL;
+}
+static void configure_lab_profile(const char* program_path)
+{
+    if (program_name_has(program_path, "-lab-audiooff")) {
+        set_default_env("RF_ASYNC", "0");
+        set_default_env("AUDIO_THREAD_BOOST", "0");
+        fprintf(stderr, "[LAB] audio enabled; worker priority boost off; synchronous renderer\n");
+    } else if (program_name_has(program_path, "-lab-noaudio")) {
+        set_default_env("PS3_NO_AUDIO", "1");
+        fprintf(stderr, "[LAB] no audio backend\n");
+    } else if (program_name_has(program_path, "-lab-silent")) {
+        set_default_env("PS3_NO_AUDIO", "1");
+        set_default_env("AUDIO_THREAD_BOOST", "0");
+        fprintf(stderr, "[LAB] no audio backend; audio workers keep host priority\n");
+    } else if (program_name_has(program_path, "-lab-demote")) {
+        set_default_env("PS3_NO_AUDIO", "1");
+        set_default_env("INFAMOUS_SILENT_AUDIO_PRIORITY", "1");
+        fprintf(stderr, "[LAB] no audio backend; streamed-audio workers demoted\n");
+    }
 }
 static const char* find_default_elf(const char* argv0)
 {
@@ -906,6 +937,7 @@ int main(int argc, char** argv)
      * messages below); changing buffering after I/O is undefined by stdio. */
     configure_stdout_buffering();
     load_settings_ini();
+    configure_lab_profile(argc > 0 ? argv[0] : NULL);
     /* v242B LOW_CPU=1 (default OFF): opt-in preset for weak CPUs. These are QUALITY levers -- the game looks/animates
      * differently from the default -- so the preset only exists for users who choose it:
      *   ANIM_LOD=1        (v216) low-detail skeletons (job size <= ANIM_LOD_MAX) update their animation every other

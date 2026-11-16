@@ -14,7 +14,23 @@
  *   Type 3 (call/return): call/return from subroutine
  */
 
+/*
+ * Two entries share ONE decoder body (rsx_decode):
+ *  - rsx_process_method: desktop/legacy semantics (global backend, vm_write32
+ *    labels, g_rsx_last_reference, getenv debug switches, telemetry globals).
+ *  - rsx_command_env_method: native semantics; every external effect goes
+ *    through caller-owned ports with a typed status, and legacy-only blocks are
+ *    unreachable (runtime) and, with PS3_RSX_COMMANDS_NATIVE_ONLY, absent
+ *    (compile time) so the native object has no hidden global dependencies.
+ * Native disposition of every legacy side effect:
+ * evidence/opus-native-rsx-command-path-r1/REVISED-DESIGN.md section 3.2.
+ */
 #include "rsx_commands.h"
+#ifdef PS3_RSX_COMMANDS_NATIVE_ONLY
+#define RSX_HAVE_LEGACY 0
+#include <string.h>
+#else
+#define RSX_HAVE_LEGACY 1
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -24,7 +40,26 @@
  * RSX-side write the guest can observe (labels, semaphores, reference, 2D transfers). */
 void (*g_rsx_vtx_sync)(void) = 0;
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#endif
 
+/* Decoder context: which entry is running and, for the native entry, its env. */
+typedef struct rsx_decode_ctx {
+    int legacy;                  /* 1 only for rsx_process_method */
+    rsx_command_env* env;        /* native entry only */
+    /* Native entry only: per-call by-value snapshots (r3 L4) of the env's ports and of
+     * the borrowed backend, taken once before decoding. A callback that mutates the
+     * borrowed backend cannot skip/replace a later notification or change the outcome
+     * owner within the current method. Legacy: NULL (it re-reads s_backend). */
+    const rsx_command_ports* ports;
+    const rsx_backend* be;
+} rsx_decode_ctx;
+#if RSX_HAVE_LEGACY
+#define RSX_IS_LEGACY(c) ((c)->legacy)
+#else
+#define RSX_IS_LEGACY(c) 0
+#endif
+
+#if RSX_HAVE_LEGACY
 /* ---------------------------------------------------------------------------
  * Global backend
  * -----------------------------------------------------------------------*/
@@ -46,6 +81,11 @@ rsx_backend* rsx_get_backend(void)
 {
     return s_backend;
 }
+/* Legacy: re-read the global on every use, exactly as before. */
+#define RSX_BE(c) (RSX_IS_LEGACY(c) ? (const rsx_backend*)s_backend : (c)->be)
+#else
+#define RSX_BE(c) ((c)->be)
+#endif /* RSX_HAVE_LEGACY */
 
 /* ---------------------------------------------------------------------------
  * State initialization
@@ -117,8 +157,9 @@ void rsx_state_init(rsx_state* state)
  * Method processing
  * -----------------------------------------------------------------------*/
 
-static int process_surface_method(rsx_state* state, u32 method, u32 data)
+static int process_surface_method(const rsx_decode_ctx* c, rsx_state* state, u32 method, u32 data)
 {
+    (void)c;
     switch (method) {
     case NV4097_SET_SURFACE_FORMAT:
         state->surface_format = data;
@@ -136,11 +177,14 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
           static unsigned _seen[32]; static int _n = 0;
           if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
               if (!f && _n < 32) { _seen[_n++] = data;
                   fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
+#endif
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:
@@ -160,10 +204,13 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static int _ct=0; if ((_ct < 24 && _ct++ < 24) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
                     data, state->surface_color_offset[0], state->surface_color_offset[1],
                     state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
+#endif
         state->color_target = data;
         state->surface_dirty = 1;
         return 0;
@@ -340,6 +387,7 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+#if RSX_HAVE_LEGACY
 /* Primitive batches (BEGIN_END begins) since the last flip; read and reset by
  * cellGcmSys' flip path for FRAME_DRAWS=1 (a renderer-independent "how much
  * is the guest drawing" -- the Linux null backend has no title bar). */
@@ -408,8 +456,39 @@ void rsx_draw_index_run(rsx_state* state, u32 first, u32 count)
         s_backend->draw_indexed(s_backend->userdata, state->primitive_type, first, count);
     }
 }
-int rsx_process_method(rsx_state* state, u32 method, u32 data)
+#endif /* RSX_HAVE_LEGACY */
+
+/* Native typed result of the draw-producing callback just invoked. Every
+ * non-OK outcome here follows a backend invocation (and, for END, rsx_state
+ * changes), so its effect is never NONE: REJECTED = known partial application,
+ * the performer says the work was not performed; anything else = UNKNOWN. */
+static rsx_cmd_status native_backend_outcome(const rsx_decode_ctx* c)
 {
+    /* Same snapshot owner as the draw just performed (r3 L4). */
+    switch (c->ports->backend_result(c->be->userdata)) {
+    case RSX_CMD_BACKEND_COMPLETED: return RSX_CMD_OK;
+    case RSX_CMD_BACKEND_RESULT_REJECTED:
+        c->env->decode_effect = RSX_CMD_EFFECT_PARTIAL;
+        return RSX_CMD_BACKEND_REJECTED;
+    default:   /* incl. out-of-range values */
+        c->env->decode_effect = RSX_CMD_EFFECT_UNKNOWN;
+        return RSX_CMD_BACKEND_COMPLETION_UNKNOWN;
+    }
+}
+/* A port may write and then fail: only an explicit REFUSED vouches for no effect. */
+static rsx_cmd_status native_port(const rsx_decode_ctx* c, rsx_cmd_port_result r)
+{
+    if (r == RSX_CMD_PORT_OK) return RSX_CMD_OK;
+    c->env->decode_effect = r == RSX_CMD_PORT_REFUSED ? RSX_CMD_EFFECT_NONE : RSX_CMD_EFFECT_UNKNOWN;
+    return RSX_CMD_PORT_FAILED;
+}
+/* Helper results: legacy -1 ("not handled") is an unsupported method natively. */
+#define RSX_HELPER(expr) ((expr) == 0 ? RSX_CMD_OK : RSX_CMD_UNSUPPORTED_METHOD)
+
+static rsx_cmd_status rsx_decode(const rsx_decode_ctx* c, rsx_state* state, u32 method, u32 data)
+{
+#if RSX_HAVE_LEGACY
+    if (RSX_IS_LEGACY(c)) {
     /* RSX_MHIST=<k>[:<len_k>]: after <k> thousand methods, count the next len_k thousand (default 4000) and
      * print a histogram (method offset, count, last data) -- what a frame is made of. */
     { static long long _mh=-2, _ml=4000000LL; static long long _mc=0; static unsigned _cnt[0x4000]; static unsigned _last[0x4000];
@@ -427,13 +506,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * (immediate-mode vertex data order matters: attribute 0 provokes the vertex). */
     { static int _it=-1; if(_it<0){ const char* e=getenv("IMM_MTRACE"); _it = e ? atoi(e) : 0; }
       if(_it && state->in_begin_end){ static int _m=0; if((_m < _it && _m++ < _it)) fprintf(stderr,"[immm] method=0x%04X data=0x%08X\n", method, data); } }
+    }
+#endif
     /* v181 hot-method pre-dispatch (perf181 [mhist], generic FIFO methods: BEGIN_END 13.3 %, DRAW_INDEX_ARRAY 11.2 %,
      * INDEX_ARRAY_ADDRESS / _DMA 6.6 % each, TRANSFORM_PROGRAM words ~10 %). They sat 60-90 comparisons down the chain
      * below. Every statement between here and their handlers is guarded by its own method test (checked), so jumping
-     * straight to the handlers is exactly the old behaviour. RSX_PREDISPATCH=0 = old chain. */
+     * straight to the handlers is exactly the old behaviour. RSX_PREDISPATCH=0 = old chain (legacy only; the native
+     * entry always pre-dispatches, which the comment above establishes as equivalent). */
+    int predispatch = 1;
+#if RSX_HAVE_LEGACY
+    if (RSX_IS_LEGACY(c))
     { static int s_pd = -1;
       if (__builtin_expect(s_pd < 0, 0)) { const char* e = getenv("RSX_PREDISPATCH"); s_pd = (e && *e == '0') ? 0 : 1; }
-      if (s_pd) {
+      predispatch = s_pd; }
+#endif
+    if (predispatch) {
           switch (method) {
           case NV4097_SET_INDEX_ARRAY_ADDRESS: state->index_array_offset = data; return 0;
           case NV4097_SET_INDEX_ARRAY_DMA:     state->index_array_dma = data; return 0;
@@ -443,7 +530,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               if (method >= NV4097_SET_TRANSFORM_PROGRAM && method < NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) goto m_transform_program;
               break;
           }
-      } }
+    }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -456,6 +543,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
+#if RSX_HAVE_LEGACY
+    if (RSX_IS_LEGACY(c))
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {
@@ -479,31 +568,44 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }
+    else
+#endif
+    {   /* Native: per-owner semaphore offset; publication through the owner's
+         * label port (same 24-bit offset and byte 0<->2 swap as above). */
+      rsx_command_env* env = c->env;
+      if (method == 0x1D6C) { env->semaphore_offset = data; return RSX_CMD_OK; }
+      if (method == 0x1D70) {
+        u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        return native_port(c, c->ports->write_label(c->ports->guest_user, env->semaphore_offset & 0x00FFFFFFu, val));
+      }
+      if (method == 0x1D74)
+        return native_port(c, c->ports->write_label(c->ports->guest_user, env->semaphore_offset & 0x00FFFFFFu, data));
+    }
     if ((method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
-        return process_surface_method(state, method, data);
+        return RSX_HELPER(process_surface_method(c, state, method, data));
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
     if (method >= 0x1A00 && method < 0x1A00 + RSX_MAX_TEXTURES * 0x20)
-        return process_texture_method(state, method, data);
+        return RSX_HELPER(process_texture_method(state, method, data));
 
     /* Texture CONTROL3: 0x1840..0x187C */
     if (method >= NV4097_SET_TEXTURE_CONTROL3 &&
         method < NV4097_SET_TEXTURE_CONTROL3 + RSX_MAX_TEXTURES * 4)
-        return process_texture_control3(state, method, data);
+        return RSX_HELPER(process_texture_control3(state, method, data));
 
     /* Vertex texture units: 0x0900..0x097C */
     if (method >= NV4097_SET_VERTEX_TEXTURE_OFFSET &&
         method < NV4097_SET_VERTEX_TEXTURE_OFFSET + RSX_MAX_VERTEX_TEXTURES * 0x20)
-        return process_vertex_texture_method(state, method, data);
+        return RSX_HELPER(process_vertex_texture_method(state, method, data));
 
     /* Vertex attribute FORMAT: 0x1740..0x177C */
     if (method >= 0x1740 && method < 0x1740 + RSX_MAX_VERTEX_ATTRIBS * 4)
-        return process_vertex_attrib_method(state, method, data);
+        return RSX_HELPER(process_vertex_attrib_method(state, method, data));
 
     /* Vertex attribute OFFSET: 0x1680..0x16BC */
     if (method >= 0x1680 && method < 0x1680 + RSX_MAX_VERTEX_ATTRIBS * 4)
-        return process_vertex_attrib_method(state, method, data);
+        return RSX_HELPER(process_vertex_attrib_method(state, method, data));
 
     /* Viewport */
     /* Viewport transform: window = ndc*scale + offset. The z lane is the
@@ -540,6 +642,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * frame. Kept in a global (read by the D3D12 backend at record time; RSX thread only) so
      * rsx_commands.h -- and every file including it -- does not change. */
     if (method == 0x1D7C) {
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c)) {
         extern u32 g_rsx_aa_control;
         g_rsx_aa_control = data;
         { static u32 seen[32]; static int ns = 0; int k = 0;
@@ -548,18 +652,32 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               fprintf(stderr, "[AA] ANTI_ALIASING_CONTROL = 0x%08X (msaa %u, alpha-to-coverage %u, alpha-to-one %u, sample mask 0x%04X; fp 0x%X)\n",
                       data, data & 1u, (data >> 4) & 1u, (data >> 8) & 1u, data >> 16, state->shader_program); } }
         return 0;
+        }
+#endif
+        /* Native: rsx_state has no field for this and the rsx_backend ABI cannot
+         * carry it, so only the reset identity (no MSAA/A2C/A2One, full sample
+         * mask) is representable; anything else would be silently lost. */
+        if (data != 0xFFFF0000u) return RSX_CMD_UNSUPPORTED_STATE;
+        c->env->aa_control = data;
+        return RSX_CMD_OK;
     }
 
     /* v90: MRT colour masks / MRT blend enables (were "[RSX-UNK]"). Decals that blend into
      * the G-buffer mask the normal target's ALPHA (material data) off; without the mask
      * they wrote alpha 0 around every leaf/garbage decal -> black squares after lighting. */
     if (method == 0x0370) { state->color_mask_mrt = data; state->mrt_seen |= 1; state->color_mask_dirty = 1;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static u32 seen[16]; static int ns = 0; int k = 0; for (int i = 0; i < ns; i++) if (seen[i] == data) k = 1;
           if (!k && ns < 16) { seen[ns++] = data; fprintf(stderr, "[MRT] colour mask MRT = 0x%08X (fp 0x%X)\n", data, state->shader_program); } }
+#endif
         return 0; }
     if (method == 0x036C) { state->blend_enable_mrt = data; state->mrt_seen |= 2; state->blend_dirty = 1;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static u32 seen[16]; static int ns = 0; int k = 0; for (int i = 0; i < ns; i++) if (seen[i] == data) k = 1;
           if (!k && ns < 16) { seen[ns++] = data; fprintf(stderr, "[MRT] blend enable MRT = 0x%08X (RT0 blend %d, fp 0x%X)\n", data, state->blend_enable, state->shader_program); } }
+#endif
         return 0; }
     /* Color mask */
     if (method == NV4097_SET_COLOR_MASK) {
@@ -595,6 +713,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c)) {
         { static int _c=0; if ((_c < 12 && _c++ < 12)) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         { static long cl = -2; static long n = 0;   /* v33 CLEAR_LOG=<skip>: log clears after <skip> clears */
           if (cl == -2) { const char* e = getenv("CLEAR_LOG"); cl = e ? atol(e) : -1; }
@@ -609,6 +729,17 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                            state->color_clear_value, depth, stencil);
         }
         return 0;
+        }
+#endif
+        {   /* Native: a clear is draw-producing work; it must be performed and
+             * report its typed outcome, never be skipped silently. */
+            const rsx_backend* be = RSX_BE(c);
+            if (!be->clear) return RSX_CMD_BACKEND_MISSING;
+            float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
+            u8 stencil = state->zstencil_clear_value & 0xFF;
+            be->clear(be->userdata, data, state->color_clear_value, depth, stencil);
+            return native_backend_outcome(c);
+        }
     }
 
     /* Blend */
@@ -656,10 +787,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == 0x0394 || method == 0x0398) {
         float f; memcpy(&f, &data, 4);
         if (method == 0x0394) state->clip_min = f; else state->clip_max = f;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         if (method == 0x0398) { static float seen[16][2]; static int ns = 0; int k = 0;
             for (int i = 0; i < ns; i++) if (seen[i][0] == state->clip_min && seen[i][1] == state->clip_max) k = 1;
             if (!k && ns < 16) { seen[ns][0] = state->clip_min; seen[ns][1] = state->clip_max; ns++;
                 fprintf(stderr, "[RSX] depth range [%g, %g] (fp 0x%X)\n", state->clip_min, state->clip_max, state->shader_program); } }
+#endif
         return 0;
     }
     /* v35: depth bounds test (inFamous masks its far-LOD city meshes with it: they are
@@ -670,12 +804,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         else { float f; memcpy(&f, &data, 4);
                if (method == 0x0384) state->depth_bounds_min = f; else state->depth_bounds_max = f; }
         state->depth_dirty = 1;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static u32 seen[16][3]; static int ns = 0; int k = 0; u32 mn, mx;
           memcpy(&mn, &state->depth_bounds_min, 4); memcpy(&mx, &state->depth_bounds_max, 4);
           for (int i = 0; i < ns; i++) if (seen[i][0] == (u32)state->depth_bounds_enable && seen[i][1] == mn && seen[i][2] == mx) k = 1;
           if (!k && ns < 16) { seen[ns][0] = (u32)state->depth_bounds_enable; seen[ns][1] = mn; seen[ns][2] = mx; ns++;
               fprintf(stderr, "[RSX] depth bounds %s [%g, %g] (fp 0x%X)\n", state->depth_bounds_enable ? "ON" : "off",
                       state->depth_bounds_min, state->depth_bounds_max, state->shader_program); } }
+#endif
         return 0;
     }
     /* v33: stencil write mask + two-sided (back face) stencil */
@@ -778,10 +915,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
         u32 w = state->vp_ucode_write;
+        /* Native: a word past the 16 KiB store would be dropped silently. */
+        if (!RSX_IS_LEGACY(c) && w > sizeof(state->vp_ucode) - 4) return RSX_CMD_UNSUPPORTED_STATE;
         if (w + 4 <= sizeof(state->vp_ucode)) {
             /* data is host-endian already; store as little-endian bytes. */
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c))
             { u32 old; memcpy(&old, &state->vp_ucode[w], 4);
               if (old != data || w + 4 > state->vp_ucode_bytes) g_rsx_vp_gen++; }   /* v64 */
+#endif
             state->vp_ucode[w+0] = (u8)(data);
             state->vp_ucode[w+1] = (u8)(data >> 8);
             state->vp_ucode[w+2] = (u8)(data >> 16);
@@ -813,6 +955,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x1880u && method < 0x1880u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
         u32 idx  = (method - 0x1880u) >> 3;
         u32 lane = ((method - 0x1880u) >> 2) & 1;
+        /* Native: an immediate vertex past RSX_IMM_MAX_VERTS would be dropped. */
+        if (!RSX_IS_LEGACY(c) && idx == 0 && lane == 1 && state->in_begin_end &&
+            state->imm_count >= RSX_IMM_MAX_VERTS) return RSX_CMD_UNSUPPORTED_STATE;
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
         if (lane == 1) { state->vertex_data4f[idx][2] = 0.0f; state->vertex_data4f[idx][3] = 1.0f; }
@@ -832,20 +977,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
         u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
+        if (!RSX_IS_LEGACY(c) && idx == 0 && lane == 3 && state->in_begin_end &&
+            state->imm_count >= RSX_IMM_MAX_VERTS) return RSX_CMD_UNSUPPORTED_STATE;
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
         if (idx == 0 && lane == 3 && state->in_begin_end && state->imm_count < RSX_IMM_MAX_VERTS)
             memcpy(state->imm_verts[state->imm_count++], state->vertex_data4f, sizeof(state->vertex_data4f));
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
           if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+#endif
         return 0;
     }
 
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && (_n < 200 && _n++ < 200))
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
+#endif
         state->transform_constant_load = data;
         return 0;
     }
@@ -862,17 +1015,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
         u32 slot = state->transform_constant_load + (reg_offset >> 2);
         u32 lane = reg_offset & 3;
+        /* Native: a constant beyond the 512-slot file (incl. u32 wrap of
+         * LOAD + reg) would be dropped or land in the wrong slot. */
+        if (!RSX_IS_LEGACY(c) &&
+            (u64)state->transform_constant_load + (reg_offset >> 2) >= RSX_MAX_VERTEX_CONSTANTS)
+            return RSX_CMD_UNSUPPORTED_STATE;
         if (slot < RSX_MAX_VERTEX_CONSTANTS) {
             float f;
             memcpy(&f, &data, 4);
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c))
             { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
               static int _n=0;
               static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
               int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+#endif
             state->vertex_constants[slot][lane] = f;
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c))
             { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && (_sq < 500 && _sq++ < 500))
                 fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+#endif
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
                 state->vertex_constants_hi = slot;
@@ -888,12 +1052,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Draw */
     m_begin_end:   /* v181 pre-dispatch target */
     if (method == NV4097_SET_BEGIN_END) {
+        rsx_cmd_status draw_status = RSX_CMD_OK;
+        /* Native (r3 L2): a nested BEGIN before END would silently discard the collected
+         * immediate vertices and re-flush state; refuse before any change (effect NONE). */
+        if (!RSX_IS_LEGACY(c) && data != 0 && state->in_begin_end) return RSX_CMD_UNSUPPORTED_STATE;
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c))
             { extern volatile unsigned g_rsx_frame_draws; g_rsx_frame_draws++; }
+#endif
             state->imm_count = 0;
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c))
             /* v32 FP_DUMP=<dir>: every distinct fragment program's raw ucode (4 KB) and
              * its decompiled HLSL, named by address + colour target, for offline
              * shader debugging (works with the null backend). */
@@ -930,31 +1103,32 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                                        state->color_target, n, n > 0 ? hl : "(decompile failed)"); fclose(f); }
                   }
               } }
+#endif
 
             /* Flush dirty state to backend before drawing */
-            if (s_backend) {
-                if (state->surface_dirty && s_backend->set_render_target)
-                    s_backend->set_render_target(s_backend->userdata, state);
-                if (state->viewport_dirty && s_backend->set_viewport)
-                    s_backend->set_viewport(s_backend->userdata, state);
-                if (state->blend_dirty && s_backend->set_blend)
-                    s_backend->set_blend(s_backend->userdata, state);
-                if ((state->depth_dirty || state->stencil_dirty) && s_backend->set_depth_stencil)
-                    s_backend->set_depth_stencil(s_backend->userdata, state);
-                if (state->color_mask_dirty && s_backend->set_color_mask)
-                    s_backend->set_color_mask(s_backend->userdata, state);
-                if (state->alpha_dirty && s_backend->set_alpha_test)
-                    s_backend->set_alpha_test(s_backend->userdata, state);
-                if (state->shader_dirty && s_backend->set_shader)
-                    s_backend->set_shader(s_backend->userdata, state);
-                if (state->vertex_dirty && s_backend->set_vertex_attribs)
-                    s_backend->set_vertex_attribs(s_backend->userdata, state);
+            if (RSX_BE(c)) {
+                if (state->surface_dirty && RSX_BE(c)->set_render_target)
+                    RSX_BE(c)->set_render_target(RSX_BE(c)->userdata, state);
+                if (state->viewport_dirty && RSX_BE(c)->set_viewport)
+                    RSX_BE(c)->set_viewport(RSX_BE(c)->userdata, state);
+                if (state->blend_dirty && RSX_BE(c)->set_blend)
+                    RSX_BE(c)->set_blend(RSX_BE(c)->userdata, state);
+                if ((state->depth_dirty || state->stencil_dirty) && RSX_BE(c)->set_depth_stencil)
+                    RSX_BE(c)->set_depth_stencil(RSX_BE(c)->userdata, state);
+                if (state->color_mask_dirty && RSX_BE(c)->set_color_mask)
+                    RSX_BE(c)->set_color_mask(RSX_BE(c)->userdata, state);
+                if (state->alpha_dirty && RSX_BE(c)->set_alpha_test)
+                    RSX_BE(c)->set_alpha_test(RSX_BE(c)->userdata, state);
+                if (state->shader_dirty && RSX_BE(c)->set_shader)
+                    RSX_BE(c)->set_shader(RSX_BE(c)->userdata, state);
+                if (state->vertex_dirty && RSX_BE(c)->set_vertex_attribs)
+                    RSX_BE(c)->set_vertex_attribs(RSX_BE(c)->userdata, state);
 
                 /* Bind dirty textures */
-                if (state->texture_dirty && s_backend->bind_texture) {
+                if (state->texture_dirty && RSX_BE(c)->bind_texture) {
                     for (u32 i = 0; i < RSX_MAX_TEXTURES; i++) {
                         if (state->textures[i].dirty) {
-                            s_backend->bind_texture(s_backend->userdata, i, &state->textures[i]);
+                            RSX_BE(c)->bind_texture(RSX_BE(c)->userdata, i, &state->textures[i]);
                             state->textures[i].dirty = 0;
                         }
                     }
@@ -973,6 +1147,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             }
         } else {
             state->in_begin_end = 0;
+#if RSX_HAVE_LEGACY
+            if (RSX_IS_LEGACY(c)) {
             /* Immediate-mode vertices collected since BEGIN: draw them now, with
              * every vertex array switched off so the fetch reads imm_verts. */
             if (state->imm_count && s_backend && s_backend->draw_arrays) {
@@ -1009,14 +1185,41 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                     state->vertex_dirty = 1;
                 }
             }
+            } else
+#endif
+            if (state->imm_count) {
+                /* Native: the collected vertices are a draw; perform it through
+                 * the owner's backend and report its typed outcome. */
+                const rsx_backend* be = RSX_BE(c);
+                if (!be->draw_arrays) {
+                    draw_status = RSX_CMD_BACKEND_MISSING;
+                } else {
+                    int saved[RSX_MAX_VERTEX_ATTRIBS];
+                    for (u32 i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++) {
+                        saved[i] = state->vertex_attribs[i].enabled;
+                        state->vertex_attribs[i].enabled = 0;
+                    }
+                    state->imm_active = 1;
+                    if (be->set_vertex_attribs)
+                        be->set_vertex_attribs(be->userdata, state);
+                    be->draw_arrays(be->userdata, state->primitive_type, 0, state->imm_count);
+                    draw_status = native_backend_outcome(c);
+                    state->imm_active = 0;
+                    for (u32 i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++)
+                        state->vertex_attribs[i].enabled = saved[i];
+                    state->vertex_dirty = 1;
+                }
+            }
             state->imm_count = 0;
         }
-        return 0;
+        return draw_status;
     }
 
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c)) {
         { static int _d=0; if ((_d < 32 && _d++ < 32)) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
         { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && (_sq < 500 && _sq++ < 500))
             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
@@ -1039,10 +1242,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         }
         frame_vert_account(state, count);
         ps3_ms("rsx:draw_arrays");
+        /* Pre-existing (kept verbatim): only the log is guarded; with no backend
+         * the call below dereferences NULL. Desktop owner decision, not changed here. */
         if (s_backend && s_backend->draw_arrays)
             rsx_stencil_log(state);
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
         return 0;
+        }
+#endif
+        {
+            const rsx_backend* be = RSX_BE(c);
+            if (!be->draw_arrays) return RSX_CMD_BACKEND_MISSING;
+            be->draw_arrays(be->userdata, state->primitive_type, first, count);
+            return native_backend_outcome(c);
+        }
     }
 
     /* v33: fixed-function fog inputs. The NV40 fragment pipe hands a program that reads
@@ -1051,16 +1264,22 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == 0x08CC || method == 0x08D0 || method == 0x08D4) {
         if (method == 0x08CC) state->fog_mode = data;
         else { float f; memcpy(&f, &data, 4); state->fog_param[(method - 0x08D0) >> 2] = f; }
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static u32 seen[24][3]; static int ns = 0; int k = 0;
           u32 p0, p1; memcpy(&p0, &state->fog_param[0], 4); memcpy(&p1, &state->fog_param[1], 4);
           for (int i = 0; i < ns; i++) if (seen[i][0] == state->fog_mode && seen[i][1] == p0 && seen[i][2] == p1) k = 1;
           if (!k && ns < 24) { seen[ns][0] = state->fog_mode; seen[ns][1] = p0; seen[ns][2] = p1; ns++;
               fprintf(stderr, "[FOG] mode=0x%X p0=%g p1=%g%c", state->fog_mode, state->fog_param[0], state->fog_param[1], 10); } }
+#endif
         return 0;
     }
     if (method == NV4097_SET_SHADER_CONTROL) {
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c))
         { static int _sc=0; if ((_sc < 12 && _sc++ < 12) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+#endif
         state->shader_control = data;
         state->shader_dirty = 1;
         return 0;
@@ -1078,14 +1297,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c)) {
         { static int _d=0; if ((_d < 8 && _d++ < 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         frame_vert_account(state, count);
         ps3_ms("rsx:draw_indexed");
+        /* Pre-existing (kept verbatim): see DRAW_ARRAYS above. */
         if (s_backend && s_backend->draw_indexed)
             rsx_stencil_log(state);
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
                                     first, count);
         return 0;
+        }
+#endif
+        {
+            const rsx_backend* be = RSX_BE(c);
+            if (!be->draw_indexed) return RSX_CMD_BACKEND_MISSING;
+            be->draw_indexed(be->userdata, state->primitive_type, first, count);
+            return native_backend_outcome(c);
+        }
     }
 
     /* Scissor */
@@ -1105,13 +1335,24 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * GCM control register can report completion back to the guest and unblock
      * the spin. Class 0 (software) method, no subchannel state needed here. */
     if (method == 0x0050) {
+#if RSX_HAVE_LEGACY
+        if (RSX_IS_LEGACY(c)) {
         if (g_rsx_vtx_sync) g_rsx_vtx_sync();   /* v33 */
         g_rsx_last_reference = data;
         return 0;
+        }
+#endif
+        /* Native: publish through the owner's port. Every earlier draw already
+         * returned COMPLETED (synchronous typed results), so FIFO order is the
+         * completion order. */
+        return native_port(c, c->ports->publish_reference(c->ports->guest_user, data));
     }
 
+#if RSX_HAVE_LEGACY
+    if (RSX_IS_LEGACY(c)) {
     /* GCM_FLIP_HEAD (0xE920/0xE924): immediate display flip from the FIFO.
-     * The draw engine handles the actual present; suppress the unknown log. */
+     * The draw engine handles the actual present; suppress the unknown log.
+     * (Legacy only: a flip is completion publication with no native service.) */
     if (method == 0xE920 || method == 0xE924) return 0;
 
     /* v36: every DISTINCT unparsed method once, in release builds too (first 96): what the
@@ -1128,14 +1369,139 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         s_unknown_count++;
     }
 #endif
+    }
+#endif
 
-    return -1;
+    return RSX_CMD_UNSUPPORTED_METHOD;
+}
+
+#if RSX_HAVE_LEGACY
+int rsx_process_method(rsx_state* state, u32 method, u32 data)
+{
+    const rsx_decode_ctx c = {1, NULL, NULL, NULL};
+    return rsx_decode(&c, state, method, data) == RSX_CMD_OK ? 0 : -1;
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Explicit-environment entry
+ * -----------------------------------------------------------------------*/
+
+#define RSX_ENV_MAGIC 0x52435645u   /* 'RCVE' */
+
+/* Every rsx_backend callback the decoder can reach. The native env refuses to
+ * run without them (no silent skip of a state notification or a draw). */
+static int native_backend_complete(const rsx_backend* b)
+{
+    return b && b->set_render_target && b->set_viewport && b->set_blend && b->set_depth_stencil &&
+           b->set_color_mask && b->set_alpha_test && b->set_shader && b->set_vertex_attribs &&
+           b->bind_texture && b->clear && b->draw_arrays && b->draw_indexed;
+}
+
+/* Lifecycle (r3 L1): *env must be zero storage or an env previously passed here.
+ * Busy (called from one of this env's own callbacks/ports): refused, nothing reset;
+ * the outer call accounts for the re-entry (A1). Otherwise construct or reset. */
+rsx_cmd_status rsx_command_env_init(rsx_command_env* env, const rsx_command_ports* ports)
+{
+    if (!env) return RSX_CMD_INVALID_ENV;
+    if (env->magic == RSX_ENV_MAGIC && env->busy) {
+        env->reentry_refused = 1;
+        return RSX_CMD_REENTRANT;
+    }
+    /* An idle reset may reuse &env->ports; preserve it before clearing env. */
+    rsx_command_ports saved_ports;
+    if (ports) {
+        saved_ports = *ports;
+        ports = &saved_ports;
+    }
+    memset(env, 0, sizeof *env);   /* the only reset of a latched failure */
+    if (!ports || !native_backend_complete(ports->backend) || !ports->backend_result || !ports->write_label ||
+        !ports->publish_reference || ports->nv4097_subchannel_mask == 0 ||
+        ports->nv4097_subchannel_mask > 0xFFu)
+        return RSX_CMD_INVALID_ENV;
+    env->ports = *ports;
+    env->aa_control = 0xFFFF0000u;   /* RSX reset value (same as the desktop default) */
+    env->failure.status = RSX_CMD_OK;
+    env->magic = RSX_ENV_MAGIC;
+    return RSX_CMD_OK;
+}
+
+/* Latch the first failure of this env. Called once per non-reentrant call. */
+static rsx_cmd_status env_latch(rsx_command_env* env, rsx_cmd_status st, rsx_cmd_effect effect,
+                                u32 subchannel, u32 method, u32 data)
+{
+    if (st != RSX_CMD_OK && !env->failed) {
+        env->failed = 1;
+        env->failure.status = st;
+        env->failure.effect = effect;
+        env->failure.subchannel = subchannel;
+        env->failure.method = method;
+        env->failure.data = data;
+    }
+    return st;
+}
+
+const rsx_command_failure* rsx_command_env_failure(const rsx_command_env* env)
+{
+    return env ? &env->failure : NULL;
+}
+
+rsx_cmd_status rsx_command_env_method(rsx_command_env* env, rsx_state* state,
+                                      u32 subchannel, u32 method, u32 data)
+{
+    if (!env || env->magic != RSX_ENV_MAGIC) return RSX_CMD_INVALID_ENV;   /* nothing to latch into */
+    if (env->busy) {
+        /* Re-entered from one of this env's own callbacks: refused with no effect;
+         * the outer call accounts for it and the failure record is left alone. */
+        env->reentry_refused = 1;
+        return RSX_CMD_REENTRANT;
+    }
+    if (env->failed) return RSX_CMD_ENV_FAILED;   /* terminal: no decode, no port, no callback */
+    if (!state || subchannel > 7u || (method & 3u) || method > 0x1FFCu)
+        return env_latch(env, RSX_CMD_INVALID_ENV, RSX_CMD_EFFECT_NONE, subchannel, method, data);
+    /* r3 L4: per-call by-value snapshots (bounded: two small structs, never rsx_state).
+     * ports.backend is borrowed: validate the snapshot before any use or state change;
+     * the decoder then uses only the snapshot for this whole method. */
+    const rsx_command_ports ports = env->ports;
+    if (!ports.backend)
+        return env_latch(env, RSX_CMD_BACKEND_MISSING, RSX_CMD_EFFECT_NONE, subchannel, method, data);
+    const rsx_backend be = *ports.backend;
+    if (!native_backend_complete(&be))
+        return env_latch(env, RSX_CMD_BACKEND_MISSING, RSX_CMD_EFFECT_NONE, subchannel, method, data);
+    if (!(ports.nv4097_subchannel_mask & (1u << subchannel)))
+        return env_latch(env, RSX_CMD_UNSUPPORTED_SUBCHANNEL, RSX_CMD_EFFECT_NONE, subchannel, method, data);
+    if (method == 0x0000) {
+        /* SET_OBJECT: only the owner's NV4097 handle keeps NV4097 semantics. */
+        rsx_cmd_status st = (ports.nv4097_object_handle != 0 && data == ports.nv4097_object_handle)
+                                ? RSX_CMD_OK : RSX_CMD_UNSUPPORTED_OBJECT;
+        return env_latch(env, st, RSX_CMD_EFFECT_NONE, subchannel, method, data);
+    }
+    const rsx_decode_ctx c = {0, env, &ports, &be};
+    env->busy = 1;
+    env->reentry_refused = 0;
+    /* Decoder-internal refusals return before any change (verified exhaustively by
+     * test_effect_none_exhaustive); performer outcomes set decode_effect. */
+    env->decode_effect = RSX_CMD_EFFECT_NONE;
+    rsx_cmd_status st = rsx_decode(&c, state, method, data);
+    rsx_cmd_effect effect = env->decode_effect;
+    if (env->reentry_refused && st == RSX_CMD_OK) {
+        /* Method completed but a callback misbehaved mid-method: terminal. An outer
+         * failure, if any, is kept as-is instead. */
+        st = RSX_CMD_REENTRANT;
+        effect = RSX_CMD_EFFECT_UNKNOWN;
+    }
+    env->reentry_refused = 0;
+    env->busy = 0;
+    return env_latch(env, st, effect, subchannel, method, data);
 }
 
 /* ---------------------------------------------------------------------------
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
+#if RSX_HAVE_LEGACY
+/* Legacy only: host-endian words, stops at any jump, global backend. The
+ * native FIFO path is native/domain/rsx_fifo_walker. */
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
@@ -1175,3 +1541,4 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 
 /* v39: last NV4097_SET_ANTI_ALIASING_CONTROL value (see the 0x1D7C handler). */
 u32 g_rsx_aa_control = 0xFFFF0000u;
+#endif /* RSX_HAVE_LEGACY */

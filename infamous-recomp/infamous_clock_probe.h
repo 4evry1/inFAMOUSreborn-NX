@@ -6,6 +6,7 @@
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include "ps3emu/host_capabilities.h"
 #include "../ps3recomp/runtime/ppu/ppu_store_observer.h"
 // v150: F7 cap toggle. Declared by hand (no <windows.h> in this header: stubs.cpp includes it).
 #ifdef _WIN32
@@ -16,7 +17,9 @@ static inline bool icp_f7_down() { return false; }
 #endif
 
 extern "C" uint8_t* vm_base;
+#if PS3_HOST_OVERLAY()
 extern "C" volatile int g_ui_fps_cap;   // v194 settings menu (rsx_ui_overlay.c): -2 unset, 0 off, else fps
+#endif
 extern "C" void (*volatile g_ps3_fz_title_dump)(const char*);
 // SPU coherency bitmap (spu_coherency.c). A marked 128-byte line makes the lifted
 // code's inline stores fall back to vm_write32, the only place the observer runs.
@@ -101,6 +104,7 @@ static bool sim_on = false;
 static bool cap_key = false, cap_active = true;   // v150: INFAMOUS_FPS_CAP_KEY=1 -> F7 toggles the cap live
 static void cap_pace_inner()
 {
+#if PS3_HOST_OVERLAY()
     {   // v194: the settings menu's Frame Rate Limit wins over F7 / the launcher
         const int uc = g_ui_fps_cap;
         static int cur = -3;
@@ -111,6 +115,7 @@ static void cap_pace_inner()
             goto paced;
         }
     }
+#endif
     if (cap_key) {
         static bool was = false;
         const bool down = icp_f7_down();
@@ -121,7 +126,9 @@ static void cap_pace_inner()
         was = down;
         if (!cap_active) return;
     }
+#if PS3_HOST_OVERLAY()
 paced:
+#endif
     const Clock::time_point now = Clock::now();
     if (cap_win == Clock::time_point{}) cap_win = now;
     if (cap_next == Clock::time_point{} || now > cap_next + 2 * cap_period) cap_next = now;   // first frame / after a hitch: resync

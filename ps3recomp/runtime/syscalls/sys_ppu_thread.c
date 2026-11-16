@@ -256,6 +256,25 @@ uint64_t ppu_thread_register_main(void)
     return 1;
 }
 
+static int silent_audio_thread_priority(void)
+{
+    const char* enable = getenv("INFAMOUS_SILENT_AUDIO_PRIORITY");
+    if (!enable || strcmp(enable, "1") != 0) return 0;
+    const char* no_audio = getenv("PS3_NO_AUDIO");
+    return no_audio && *no_audio && strcmp(no_audio, "0") != 0;
+}
+
+static int is_audio_service_thread(const char* name)
+{
+    return strstr(name, "brb") || strstr(name, "snd_stream") ||
+           strstr(name, "Audio");
+}
+
+static int is_streamed_audio_service_thread(const char* name)
+{
+    return strstr(name, "snd_stream") != NULL;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_ppu_thread_create
  *
@@ -479,10 +498,21 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * play139-143: the game's mixer output arrives in bursts with stalls of tens of ms (holes) while the SPU
      * mixer itself (w3) has its own core and is not always saturated. */
     { static int s_ab = -1; if (s_ab < 0) { const char* e = getenv("AUDIO_THREAD_BOOST"); s_ab = (e && *e == '0') ? 0 : 1; }
-      if (s_ab && (strstr(t->name, "brb") || strstr(t->name, "snd_stream") || strstr(t->name, "Audio"))) {
+      if (s_ab && is_audio_service_thread(t->name) && !silent_audio_thread_priority()) {
           SetThreadPriority(t->host_thread, THREAD_PRIORITY_HIGHEST);
           fprintf(stderr, "[SYS] v144 audio thread \"%s\" (guest prio %d) -> host HIGHEST\n", t->name, priority);
       } }
+    /* PS3_NO_AUDIO reports that cellAudio is unavailable, but inFamous still
+     * creates sixteen streamed-audio service threads. Boosting those CPU-bound
+     * guest pollers above the normal-priority Bink/movie threads starves movie
+     * progress on a three-core host. They may still service game state; only
+     * their host scheduling class changes while the backend is intentionally
+     * absent. */
+    if (is_streamed_audio_service_thread(t->name) && silent_audio_thread_priority()) {
+        SetThreadPriority(t->host_thread, THREAD_PRIORITY_BELOW_NORMAL);
+        fprintf(stderr, "[SYS] silent audio thread \"%s\" (guest prio %d) -> host BELOW_NORMAL\n",
+                t->name, priority);
+    }
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
@@ -1643,7 +1673,7 @@ void ps3_fz_enter(ppu_context* ctx, uint32_t kind, uint32_t num, void* vsave)
     ps3_fz_rec* save = (ps3_fz_rec*)vsave;
     uint64_t tid = ctx ? ctx->thread_id : 0;
     if (tid >= FZ_MAXT || !fz_on()) { save->kind = 0xFFFFFFFFu; return; }
-    if (!s_fz_t0_ms) fz_start_watch();
+    fz_start_watch();
     ps3_fz_rec* r = &s_fz[tid];
     *save = *r;
     ps3_fz_rec n;
@@ -1960,17 +1990,62 @@ static void* fz_watch_thread(void* p)
     return 0;
 #endif
 }
-static void fz_start_watch(void)
+static void fz_initialize_watch(void)
 {
-    static volatile long s_once = 0;
-    if (InterlockedExchange(&s_once, 1)) { while (!s_fz_t0_ms) { /* tiny window */ } return; }
     fz_tr_on();   /* v107: decide FIOS_TRACE before the first traced exit */
+    /* The epoch belongs to the records, even when the optional host thread
+     * cannot start. Publish it before a successful worker can read it. */
+    s_fz_t0_ms = fz_now_ms();
 #ifdef _WIN32
     HANDLE h = (HANDLE)_beginthreadex(NULL, 256 * 1024, fz_watch_thread, NULL, 0, NULL);
-    if (h) CloseHandle(h);
+    if (h) {
+        if (!CloseHandle(h)) fprintf(stderr, "[FREEZE] watchdog handle cleanup failed\n");
+    } else {
+        fprintf(stderr, "[FREEZE] optional watchdog unavailable: thread creation failed\n");
+    }
 #else
-    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 256 * 1024);
-    pthread_create(&th, &at, fz_watch_thread, NULL); pthread_detach(th);
+    pthread_attr_t attributes;
+    int error = pthread_attr_init(&attributes);
+    if (error) {
+        fprintf(stderr, "[FREEZE] optional watchdog unavailable: attribute initialization error %d\n", error);
+        return;
+    }
+    error = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    if (!error) {
+        pthread_t thread;
+        /* Use the platform's stack size: this executable's static TLS alone
+         * exceeds the previous 256 KiB stack and makes pthread_create fail. */
+        error = pthread_create(&thread, &attributes, fz_watch_thread, NULL);
+    }
+    int cleanup_error = pthread_attr_destroy(&attributes);
+    if (cleanup_error) fprintf(stderr, "[FREEZE] watchdog attribute cleanup error %d\n", cleanup_error);
+    if (error) fprintf(stderr, "[FREEZE] optional watchdog unavailable: thread startup error %d\n", error);
 #endif
-    s_fz_t0_ms = fz_now_ms();
+}
+
+#ifdef _WIN32
+static BOOL CALLBACK fz_initialize_watch_once(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once; (void)parameter; (void)context;
+    fz_initialize_watch();
+    return TRUE;
+}
+#endif
+
+static void fz_start_watch(void)
+{
+#ifdef _WIN32
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    if (!InitOnceExecuteOnce(&once, fz_initialize_watch_once, NULL, NULL)) {
+        static volatile long logged = 0;
+        if (!InterlockedExchange(&logged, 1)) fprintf(stderr, "[FREEZE] watchdog initialization unavailable\n");
+    }
+#else
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    int error = pthread_once(&once, fz_initialize_watch);
+    if (error) {
+        static volatile long logged = 0;
+        if (!InterlockedExchange(&logged, 1)) fprintf(stderr, "[FREEZE] watchdog initialization error %d\n", error);
+    }
+#endif
 }
